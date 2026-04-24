@@ -1,0 +1,48 @@
+defaults:
+  dataset: ISIC2019LT
+  image_size: 224
+  backbone: resnet50
+  pretrained: true
+  use_projector: true
+  proj_dim: 128
+  proj_hidden_dim: 0
+  epochs: 200
+  batch_size: 128
+  num_workers: 8
+  lr: 0.001
+  weight_decay: 0.0001
+  momentum: 0.9
+  cls_loss: ce
+  cls_warmup_epochs: 150
+  use_class_weight: false
+  pcd_weight: 1.0
+  pcd_temp: 0.05
+  spkd_weight: 10.0
+  var_weight: 0.2
+  var_beta: 0.5
+  ema_decay: 0.99
+  proto_momentum: 0.96
+  recal_interval: 5
+  recal_alpha: 0.15
+  tail_alpha: true
+  queue_size: 1024
+  seed: 42
+
+paths:
+  data_root_isic2019lt: /data/DataLACP/guyiqin/ISIC2019LT/ISIC_2019_Training_Input
+  split_root_isic2019lt: /data/DataLACP/guyiqin/CODE/TPCSD/split/ISIC2019LT
+  data_root_isic_archive: /data/DataLACP/guyiqin/ISIC_Archive
+  split_root_isic_archive: /data/DataLACP/guyiqin/CODE/TPCSD/split/ISIC_Archive
+  checkpoints: ./checkpoints
+  logs: ./log/tpcsd
+
+stage2:
+  epochs: 100
+  batch_size: 64
+  stage2_batch_size: 2048
+  lambda_mu: 0.7
+  gamma_proto: 0.2
+  delta_noise: 0.01
+  aas_alpha: 1.0
+  virtual_ratio: 1.0
+  merge_real: true

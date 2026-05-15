@@ -18,6 +18,8 @@ NUM_WORKERS="${NUM_WORKERS:-8}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
 STAGE1_RUN_DIR="${STAGE1_RUN_DIR:-}"
 STAGE2_RUN_DIR="${STAGE2_RUN_DIR:-}"
+STAGE1_CKPT_TAG="${STAGE1_CKPT_TAG:-best}"
+STAGE2_CKPT_TAG="${STAGE2_CKPT_TAG:-best}"
 
 TRAIN_CSV="${SPLIT_DIR}/training.csv"
 VAL_CSV="${SPLIT_DIR}/validation.csv"
@@ -34,8 +36,8 @@ fi
 [[ -n "${STAGE2_RUN_DIR}" ]] || { echo "Could not resolve latest Stage2 run dir." >&2; exit 1; }
 
 PROJECTOR_CKPT=""
-if [[ -f "${STAGE1_RUN_DIR}/projector_latest.pth" ]]; then
-  PROJECTOR_CKPT="${STAGE1_RUN_DIR}/projector_latest.pth"
+if [[ -f "${STAGE1_RUN_DIR}/projector_${STAGE1_CKPT_TAG}.pth" ]]; then
+  PROJECTOR_CKPT="${STAGE1_RUN_DIR}/projector_${STAGE1_CKPT_TAG}.pth"
 fi
 
 python analyze_last_stage2.py \
@@ -44,13 +46,13 @@ python analyze_last_stage2.py \
   --csv_file_train "${TRAIN_CSV}" \
   --csv_file_val "${VAL_CSV}" \
   --csv_file_test "${TEST_CSV}" \
-  --encoder_ckpt "${STAGE1_RUN_DIR}/resnet_encoder_latest.pth" \
+  --encoder_ckpt "${STAGE1_RUN_DIR}/resnet_encoder_${STAGE1_CKPT_TAG}.pth" \
   --projector_ckpt "${PROJECTOR_CKPT}" \
-  --prototype_ckpt "${STAGE1_RUN_DIR}/prototype_memory_latest.pth" \
-  --classifier_ckpt "${STAGE2_RUN_DIR}/classifier_latest.pth" \
-  --gaussian_mu_ckpt "${STAGE2_RUN_DIR}/gaussian_mu_latest.pth" \
-  --gaussian_sigma_ckpt "${STAGE2_RUN_DIR}/gaussian_sigma_latest.pth" \
-  --shared_cov_ckpt "${STAGE2_RUN_DIR}/shared_cov_latest.pth" \
+  --prototype_ckpt "${STAGE1_RUN_DIR}/prototype_memory_${STAGE1_CKPT_TAG}.pth" \
+  --classifier_ckpt "${STAGE2_RUN_DIR}/classifier_${STAGE2_CKPT_TAG}.pth" \
+  --gaussian_mu_ckpt "${STAGE2_RUN_DIR}/gaussian_mu_${STAGE2_CKPT_TAG}.pth" \
+  --gaussian_sigma_ckpt "${STAGE2_RUN_DIR}/gaussian_sigma_${STAGE2_CKPT_TAG}.pth" \
+  --shared_cov_ckpt "${STAGE2_RUN_DIR}/shared_cov_${STAGE2_CKPT_TAG}.pth" \
   --cov_scale_factor 1.0 \
   --backbone resnet18 \
   --image_size "${IMAGE_SIZE}" \

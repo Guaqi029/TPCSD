@@ -19,6 +19,7 @@ BATCH_SIZE="${BATCH_SIZE:-256}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
 RUN_DIR="${RUN_DIR:-}"
+CKPT_TAG="${CKPT_TAG:-best}"
 
 TRAIN_CSV="${LT_SPLIT_ROOT}/shared_eval_seed${SEED}/training_if${FACTOR}.csv"
 VAL_CSV="${LT_SPLIT_ROOT}/shared_eval_seed${SEED}/validation.csv"
@@ -29,8 +30,8 @@ if [[ -z "${RUN_DIR}" ]]; then
 fi
 
 [[ -n "${RUN_DIR}" ]] || { echo "Could not resolve latest Stage1 run dir." >&2; exit 1; }
-[[ -f "${RUN_DIR}/resnet_encoder_latest.pth" ]] || { echo "Missing encoder checkpoint in ${RUN_DIR}" >&2; exit 1; }
-[[ -f "${RUN_DIR}/classifier_latest.pth" ]] || { echo "Missing classifier checkpoint in ${RUN_DIR}" >&2; exit 1; }
+[[ -f "${RUN_DIR}/resnet_encoder_${CKPT_TAG}.pth" ]] || { echo "Missing encoder checkpoint in ${RUN_DIR}" >&2; exit 1; }
+[[ -f "${RUN_DIR}/classifier_${CKPT_TAG}.pth" ]] || { echo "Missing classifier checkpoint in ${RUN_DIR}" >&2; exit 1; }
 
 python eval_last_stage1.py \
   --dataset ISIC2019LT \
@@ -38,8 +39,8 @@ python eval_last_stage1.py \
   --csv_file_train "${TRAIN_CSV}" \
   --csv_file_val "${VAL_CSV}" \
   --csv_file_test "${TEST_CSV}" \
-  --encoder_ckpt "${RUN_DIR}/resnet_encoder_latest.pth" \
-  --classifier_ckpt "${RUN_DIR}/classifier_latest.pth" \
+  --encoder_ckpt "${RUN_DIR}/resnet_encoder_${CKPT_TAG}.pth" \
+  --classifier_ckpt "${RUN_DIR}/classifier_${CKPT_TAG}.pth" \
   --backbone resnet18 \
   --image_size "${IMAGE_SIZE}" \
   --batch_size "${BATCH_SIZE}" \

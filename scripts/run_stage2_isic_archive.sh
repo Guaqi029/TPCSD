@@ -21,6 +21,7 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 EPOCHS="${EPOCHS:-100}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
 STAGE1_RUN_DIR="${STAGE1_RUN_DIR:-}"
+CKPT_TAG="${CKPT_TAG:-best}"
 
 TRAIN_CSV="${SPLIT_DIR}/training.csv"
 VAL_CSV="${SPLIT_DIR}/validation.csv"
@@ -37,9 +38,9 @@ fi
 
 [[ -n "${STAGE1_RUN_DIR}" ]] || { echo "Could not resolve latest Stage1 run dir." >&2; exit 1; }
 
-ENCODER_CKPT="${STAGE1_RUN_DIR}/resnet_encoder_latest.pth"
-PROTOTYPE_CKPT="${STAGE1_RUN_DIR}/prototype_memory_latest.pth"
-PROJECTOR_CKPT="${STAGE1_RUN_DIR}/projector_latest.pth"
+ENCODER_CKPT="${STAGE1_RUN_DIR}/resnet_encoder_${CKPT_TAG}.pth"
+PROTOTYPE_CKPT="${STAGE1_RUN_DIR}/prototype_memory_${CKPT_TAG}.pth"
+PROJECTOR_CKPT="${STAGE1_RUN_DIR}/projector_${CKPT_TAG}.pth"
 
 [[ -f "${ENCODER_CKPT}" ]] || { echo "Missing encoder_ckpt: ${ENCODER_CKPT}" >&2; exit 1; }
 [[ -f "${PROJECTOR_CKPT}" ]] || { echo "Missing projector_ckpt: ${PROJECTOR_CKPT}" >&2; exit 1; }

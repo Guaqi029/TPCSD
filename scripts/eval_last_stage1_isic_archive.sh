@@ -38,7 +38,7 @@ python eval_last_stage1.py \
   --csv_file_test "${TEST_CSV}" \
   --encoder_ckpt "${RUN_DIR}/resnet_encoder_latest.pth" \
   --classifier_ckpt "${RUN_DIR}/classifier_latest.pth" \
-  --backbone resnet50 \
+  --backbone resnet18 \
   --image_size "${IMAGE_SIZE}" \
   --batch_size "${BATCH_SIZE}" \
   --workers "${NUM_WORKERS}"

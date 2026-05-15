@@ -13,6 +13,7 @@ from data.dataset import ISICDataset
 from data.transforms import Transforms
 from models import Projector, ResNetBackbone
 from utils.checkpoint_utils import load_state_dict_flexible
+from utils.losses import prototype_uniformity_loss
 from utils.metrics import build_group_specs
 from visualize_embeddings import save_named_point_tsne, save_prototype_mean_tsne, save_similarity_heatmap
 
@@ -206,6 +207,7 @@ def main():
     prototype_cosine_summary = summarize_off_diagonal_similarity(
         prototype_cosine_matrix, list(train_base.class_names), threshold=0.8
     )
+    prototype_uniformity = float(prototype_uniformity_loss(prototypes, t=2.0).item())
 
     rows = []
     for class_id, class_name in enumerate(train_base.class_names):
@@ -316,6 +318,7 @@ def main():
         "mean_proto_mean_cosine": float(np.mean([row["proto_mean_cosine"] for row in rows])),
         "min_proto_mean_cosine": float(np.min([row["proto_mean_cosine"] for row in rows])),
         "mean_proto_mean_l2": float(np.mean([row["proto_mean_l2"] for row in rows])),
+        "prototype_uniformity_loss_t2": prototype_uniformity,
         "prototype_cosine_summary": {
             "mean_off_diagonal_cosine": prototype_cosine_summary["mean_off_diagonal_cosine"],
             "max_off_diagonal_cosine": prototype_cosine_summary["max_off_diagonal_cosine"],
@@ -331,6 +334,7 @@ def main():
     print(f"mean proto-mean cosine: {summary['mean_proto_mean_cosine']:.6f}")
     print(f"min proto-mean cosine: {summary['min_proto_mean_cosine']:.6f}")
     print(f"mean proto-mean l2: {summary['mean_proto_mean_l2']:.6f}")
+    print(f"prototype uniformity loss (t=2.0): {summary['prototype_uniformity_loss_t2']:.6f}")
     print(
         "prototype off-diagonal cosine: "
         f"mean={prototype_cosine_summary['mean_off_diagonal_cosine']:.6f}, "

@@ -53,18 +53,20 @@ python train_stage1.py \
   --workers "${NUM_WORKERS}" \
   --image_size "${IMAGE_SIZE}" \
   --seed "${SEED}" \
-  --backbone resnet50 \
+  --backbone resnet18 \
   "${PRETRAIN_FLAG}" \
   --use_projector \
   --proj_dim 128 \
   --cls_loss ce \
   --pcd_weight 1.0 \
   --pcd_temp 0.05 \
+  --pcd_margin 0.85 \
   --spkd_weight 10.0 \
-  --var_weight 0.2 \
-  --var_beta 0.5 \
+  --punif_weight 1.0 \
+  --punif_t 2.0 \
+  --punif_warmup_start_epoch 15 \
+  --punif_warmup_end_epoch 30 \
   --proto_momentum 0.96 \
   --recal_interval 5 \
   --recal_alpha 0.15 \
-  --tail_alpha \
   --queue_size 1024

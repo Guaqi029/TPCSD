@@ -17,9 +17,12 @@ defaults:
   use_class_weight: false
   pcd_weight: 1.0
   pcd_temp: 0.05
+  pcd_margin: 0.85
   spkd_weight: 10.0
-  var_weight: 0.2
-  var_beta: 0.5
+  punif_weight: 1.0
+  punif_t: 2.0
+  punif_warmup_start_epoch: 15
+  punif_warmup_end_epoch: 30
   ema_decay: 0.99
   proto_momentum: 0.96
   recal_interval: 5
@@ -40,9 +43,10 @@ stage2:
   epochs: 100
   batch_size: 64
   stage2_batch_size: 2048
-  lambda_mu: 0.7
-  gamma_proto: 0.2
+  lambda_mu: 0.5
   delta_noise: 0.01
-  aas_alpha: 1.0
+  cov_scale_factor: 1.0
+  aas_alpha: 2.0
   virtual_ratio: 1.0
   merge_real: true
+  use_class_weight: false

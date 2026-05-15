@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -62,42 +64,39 @@ def sp_kd_loss(student_features, teacher_features, student_memory=None, teacher_
     return torch.sum((gram_s - gram_t) ** 2)
 
 
-def pcd_loss(z, labels, prototypes, temperature=0.07, sample_weights=None):
+def prototype_uniformity_loss(prototypes, t=2.0, active_mask=None):
+    if prototypes.numel() == 0:
+        return prototypes.new_tensor(0.0)
+
+    if active_mask is not None:
+        active_mask = active_mask.to(device=prototypes.device, dtype=torch.bool)
+        prototypes = prototypes[active_mask]
+
+    if prototypes.numel() == 0 or prototypes.shape[0] < 2:
+        return prototypes.new_tensor(0.0)
+
+    prototypes = F.normalize(prototypes, p=2, dim=1)
+    sim_matrix = torch.matmul(prototypes, prototypes.t())
+    off_diag_mask = ~torch.eye(sim_matrix.shape[0], device=sim_matrix.device, dtype=torch.bool)
+    off_diag = sim_matrix[off_diag_mask]
+
+    if off_diag.numel() == 0:
+        return sim_matrix.new_tensor(0.0)
+
+    return torch.logsumexp(float(t) * off_diag, dim=0) - math.log(off_diag.numel())
+
+
+def pcd_loss(z, labels, prototypes, temperature=0.07, sample_weights=None, pcd_margin=0.85):
     if z.numel() == 0:
         return z.new_tensor(0.0)
     z = F.normalize(z, p=2, dim=1)
     p = F.normalize(prototypes, p=2, dim=1)
-    logits = torch.matmul(z, p.t()) / float(temperature)
-    loss = F.cross_entropy(logits, labels, reduction="none")
+    target_proto = p[labels]
+    cos_sim = F.cosine_similarity(z, target_proto, dim=1)
+    loss = torch.clamp(float(pcd_margin) - cos_sim, min=0.0)
     if sample_weights is not None:
         loss = loss * sample_weights
     return loss.mean()
-
-
-def var_preserve_loss(z, labels, head_classes, tail_classes, beta=0.8):
-    if z.numel() == 0:
-        return z.new_tensor(0.0)
-    head_vars = []
-    for c in head_classes:
-        idx = labels == c
-        if idx.sum() < 2:
-            continue
-        var = z[idx].var(dim=0, unbiased=False).mean()
-        head_vars.append(var)
-    if not head_vars:
-        return z.new_tensor(0.0)
-    head_var = torch.stack(head_vars).mean()
-
-    tail_losses = []
-    for c in tail_classes:
-        idx = labels == c
-        if idx.sum() < 2:
-            continue
-        var = z[idx].var(dim=0, unbiased=False).mean()
-        tail_losses.append(F.relu(beta * head_var - var))
-    if not tail_losses:
-        return z.new_tensor(0.0)
-    return torch.stack(tail_losses).mean()
 
 
 def compute_batch_class_means(z, labels, num_classes):

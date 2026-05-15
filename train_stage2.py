@@ -12,12 +12,13 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from data.dataset import ISICDataset
 from data.transforms import Transforms
-from models import ResNetBackbone, Projector, l2_normalize
+from models import CosineClassifier, Projector, ResNetBackbone
 from utils.csv_utils import label_frame_to_int
 from utils.metrics import (
     append_per_class_records,
     build_group_specs,
     compute_avg_metrics,
+    compute_macro_metric,
     compute_per_class_metrics,
     format_tail_lines,
     plot_loss_curve,
@@ -32,6 +33,26 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def load_state_dict_compat(model, ckpt_path):
+    state_dict = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(state_dict, dict) and "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+        state_dict = state_dict["state_dict"]
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Unsupported checkpoint format: {ckpt_path}")
+
+    normalized_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("module."):
+            normalized_state_dict[key[len("module."):]] = value
+        else:
+            normalized_state_dict[key] = value
+    model.load_state_dict(normalized_state_dict)
 
 
 class SingleTransformDataset(Dataset):
@@ -90,6 +111,18 @@ def compute_class_stats(feats, labels, num_classes):
     return mu, sigma
 
 
+def compute_shared_covariance(feats, labels, mu, jitter=1e-4):
+    if feats.numel() == 0:
+        return torch.eye(mu.shape[1], dtype=mu.dtype)
+
+    centered = feats - mu.index_select(0, labels.long())
+    denom = max(int(centered.shape[0]) - 1, 1)
+    cov = centered.t().matmul(centered) / float(denom)
+    cov = 0.5 * (cov + cov.t())
+    cov = cov + torch.eye(cov.shape[0], dtype=cov.dtype) * float(jitter)
+    return cov
+
+
 def compute_per_class_acc(classifier, feats, labels, num_classes, device):
     classifier.eval()
     with torch.no_grad():
@@ -120,21 +153,19 @@ def softmax_alloc(acc, alpha, total):
     return counts, weights
 
 
-def sample_virtual_features(mu, sigma, prototypes, counts, gamma=0.2, delta=0.01):
+def sample_virtual_features(mu, shared_cov, counts, delta=0.01, cov_scale_factor=1.0):
     device = mu.device
     feats = []
     labels = []
     num_classes = mu.shape[0]
+    base_cov = shared_cov * float(cov_scale_factor)
+    base_cov = base_cov + torch.eye(shared_cov.shape[0], device=device, dtype=shared_cov.dtype) * (float(delta) ** 2)
     for c in range(num_classes):
         k = int(counts[c].item())
         if k <= 0:
             continue
-        eps = torch.randn(k, mu.shape[1], device=device)
-        noise = torch.randn(k, mu.shape[1], device=device)
-        mu_c = mu[c].unsqueeze(0)
-        sigma_c = sigma[c].unsqueeze(0)
-        proto_c = prototypes[c].unsqueeze(0)
-        z = mu_c + eps * sigma_c + gamma * (proto_c - mu_c) + delta * noise
+        mvn = torch.distributions.MultivariateNormal(loc=mu[c], covariance_matrix=base_cov)
+        z = mvn.sample((k,))
         feats.append(z)
         labels.append(torch.full((k,), c, device=device, dtype=torch.long))
     if not feats:
@@ -151,7 +182,8 @@ def evaluate_classifier(classifier, feats, labels, device, num_classes):
         probs = torch.softmax(logits, dim=1).cpu()
     acc, f1, auc, bac, sens, spec = compute_avg_metrics(labels, probs)
     per_class = compute_per_class_metrics(labels, probs, num_classes=num_classes)
-    return (acc, f1, auc, bac, sens, spec), per_class
+    bacc = compute_macro_metric(per_class, metric_key="bacc")
+    return (acc, f1, auc, bac, bacc, sens, spec), per_class
 
 
 def main():
@@ -175,16 +207,17 @@ def main():
     parser.add_argument("--proj_dim", type=int, default=128)
     parser.add_argument("--proj_hidden_dim", type=int, default=0)
     parser.add_argument("--encoder_ckpt", required=True)
-    parser.add_argument("--projector_ckpt", default="")
-    parser.add_argument("--prototype_ckpt", default="")
-    parser.add_argument("--lambda_mu", type=float, default=0.7)
-    parser.add_argument("--gamma_proto", type=float, default=0.2)
+    parser.add_argument("--projector_ckpt", required=True)
+    parser.add_argument("--prototype_ckpt", required=True)
+    parser.add_argument("--lambda_mu", type=float, default=0.5)
     parser.add_argument("--delta_noise", type=float, default=0.01)
-    parser.add_argument("--aas_alpha", type=float, default=1.0)
+    parser.add_argument("--cov_scale_factor", type=float, default=1.0)
+    parser.add_argument("--aas_alpha", type=float, default=2.0)
     parser.add_argument("--virtual_ratio", type=float, default=1.0)
     parser.add_argument("--merge_real", action="store_true")
     parser.add_argument("--use_class_weight", action="store_true")
-    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--cosine_scale", type=float, default=16.0)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -213,6 +246,13 @@ def main():
     _, _, tail_classes = np.array_split(np.argsort(-counts), 3)
     tail_classes = [int(x) for x in tail_classes.tolist()]
 
+    if not args.use_projector:
+        raise ValueError("Stage2 requires --use_projector because prototypes live in the projected feature space.")
+    if not os.path.isfile(args.projector_ckpt):
+        raise FileNotFoundError(f"projector_ckpt not found: {args.projector_ckpt}")
+    if not os.path.isfile(args.prototype_ckpt):
+        raise FileNotFoundError(f"prototype_ckpt not found: {args.prototype_ckpt}")
+
     encoder = ResNetBackbone(args.backbone, pretrained=False)
     feat_dim = encoder.feat_dim
     projector = None
@@ -221,26 +261,29 @@ def main():
         projector = Projector(feat_dim, proj_dim=args.proj_dim, hidden_dim=args.proj_hidden_dim)
         proj_dim = args.proj_dim
 
-    encoder = encoder.to(device)
-    if projector is not None:
-        projector = projector.to(device)
-
     if not os.path.isfile(args.encoder_ckpt):
         raise FileNotFoundError(f"encoder_ckpt not found: {args.encoder_ckpt}")
-    encoder.load_state_dict(torch.load(args.encoder_ckpt, map_location="cpu"))
+    load_state_dict_compat(encoder, args.encoder_ckpt)
+    encoder = encoder.to(device)
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad = False
 
-    if projector is not None and args.projector_ckpt:
-        if not os.path.isfile(args.projector_ckpt):
-            raise FileNotFoundError(f"projector_ckpt not found: {args.projector_ckpt}")
-        projector.load_state_dict(torch.load(args.projector_ckpt, map_location="cpu"))
+    if projector is not None:
+        load_state_dict_compat(projector, args.projector_ckpt)
+        projector = projector.to(device)
         projector.eval()
         for p in projector.parameters():
             p.requires_grad = False
 
-    classifier = nn.Linear(proj_dim, num_classes).to(device)
+    classifier = CosineClassifier(proj_dim, num_classes, scale=args.cosine_scale).to(device)
+
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        encoder = nn.DataParallel(encoder)
+        classifier = nn.DataParallel(classifier)
+        if projector is not None:
+            projector = nn.DataParallel(projector)
+
     optimizer = optim.SGD(classifier.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=0.9)
 
     ckpt_root = os.path.join(args.checkpoints, args.run_name or f"run_tpcsd_stage2_{int(time.time())}")
@@ -254,11 +297,7 @@ def main():
         "test": {"epoch": [], "acc": [], "bac": []},
     }
 
-    prototypes = None
-    if args.prototype_ckpt and os.path.isfile(args.prototype_ckpt):
-        prototypes = torch.load(args.prototype_ckpt, map_location="cpu").float()
-    else:
-        prototypes = torch.zeros(num_classes, proj_dim, dtype=torch.float32)
+    prototypes = torch.load(args.prototype_ckpt, map_location="cpu").float()
 
     for epoch in range(1, args.epochs + 1):
         # Extract real features
@@ -268,8 +307,10 @@ def main():
 
         # Compute Gaussian stats
         mu, sigma = compute_class_stats(train_feats, train_labels, num_classes)
+        shared_cov = compute_shared_covariance(train_feats, train_labels, mu)
         mu = mu.to(device)
         sigma = sigma.to(device)
+        shared_cov = shared_cov.to(device)
 
         proto = prototypes.to(device)
         if proto.shape[1] != mu.shape[1]:
@@ -283,7 +324,11 @@ def main():
 
         # Sample virtual features
         virt_feats, virt_labels = sample_virtual_features(
-            mu_tilde, sigma, proto, alloc, gamma=args.gamma_proto, delta=args.delta_noise
+            mu_tilde,
+            shared_cov,
+            alloc,
+            delta=args.delta_noise,
+            cov_scale_factor=args.cov_scale_factor,
         )
 
         if args.merge_real:
@@ -322,8 +367,10 @@ def main():
         log_line = (
             f"Epoch {epoch}/{args.epochs} "
             f"loss={train_loss:.6f} "
-            f"val_acc={val_metrics[0]:.6f} val_bac={val_metrics[3]:.6f} "
-            f"test_acc={test_metrics[0]:.6f} test_bac={test_metrics[3]:.6f}"
+            f"cov_scale={args.cov_scale_factor:.4f} "
+            f"cos_scale={args.cosine_scale:.4f} "
+            f"val_acc={val_metrics[0]:.6f} val_bac={val_metrics[3]:.6f} val_bacc={val_metrics[4]:.6f} "
+            f"test_acc={test_metrics[0]:.6f} test_bac={test_metrics[3]:.6f} test_bacc={test_metrics[4]:.6f}"
         )
         print(log_line)
         with open(log_path, "a", encoding="utf-8") as f:
@@ -335,9 +382,10 @@ def main():
                 print(line)
                 f.write(line + "\n")
 
-        torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_latest.pth"))
+        torch.save(unwrap_model(classifier).state_dict(), os.path.join(ckpt_root, "classifier_latest.pth"))
         torch.save(mu.cpu(), os.path.join(ckpt_root, "gaussian_mu_latest.pth"))
         torch.save(sigma.cpu(), os.path.join(ckpt_root, "gaussian_sigma_latest.pth"))
+        torch.save(shared_cov.cpu(), os.path.join(ckpt_root, "shared_cov_latest.pth"))
 
 
 if __name__ == "__main__":

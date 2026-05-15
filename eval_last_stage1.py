@@ -17,6 +17,7 @@ from utils.metrics import (
     build_group_lookup,
     build_group_specs,
     compute_avg_metrics,
+    compute_macro_metric,
     compute_group_metric,
     compute_per_class_metrics,
     format_group_class_lines,
@@ -143,8 +144,12 @@ def main():
 
     val_group_acc = compute_group_metric(val_per_class, groups, metric_key="acc")
     val_group_bac = compute_group_metric(val_per_class, groups, metric_key="bac")
+    val_group_bacc = compute_group_metric(val_per_class, groups, metric_key="bacc")
     test_group_acc = compute_group_metric(test_per_class, groups, metric_key="acc")
     test_group_bac = compute_group_metric(test_per_class, groups, metric_key="bac")
+    test_group_bacc = compute_group_metric(test_per_class, groups, metric_key="bacc")
+    val_bacc = compute_macro_metric(val_per_class, metric_key="bacc")
+    test_bacc = compute_macro_metric(test_per_class, metric_key="bacc")
 
     output_dir = args.output_dir or os.path.join(os.path.dirname(args.encoder_ckpt), "offline_eval_stage1")
     os.makedirs(output_dir, exist_ok=True)
@@ -172,20 +177,24 @@ def main():
             "f1": float(val_metrics[1]),
             "auc": float(val_metrics[2]),
             "bac": float(val_metrics[3]),
+            "bacc": float(val_bacc),
             "sens": float(val_metrics[4]),
             "spec": float(val_metrics[5]),
             "group_acc": val_group_acc,
             "group_bac": val_group_bac,
+            "group_bacc": val_group_bacc,
         },
         "test": {
             "acc": float(test_metrics[0]),
             "f1": float(test_metrics[1]),
             "auc": float(test_metrics[2]),
             "bac": float(test_metrics[3]),
+            "bacc": float(test_bacc),
             "sens": float(test_metrics[4]),
             "spec": float(test_metrics[5]),
             "group_acc": test_group_acc,
             "group_bac": test_group_bac,
+            "group_bacc": test_group_bacc,
         },
     }
     with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
@@ -219,16 +228,20 @@ def main():
 
     print(
         "val: "
-        f"acc={val_metrics[0]:.6f}, f1={val_metrics[1]:.6f}, auc={val_metrics[2]:.6f}, bac={val_metrics[3]:.6f}"
+        f"acc={val_metrics[0]:.6f}, f1={val_metrics[1]:.6f}, auc={val_metrics[2]:.6f}, "
+        f"bac={val_metrics[3]:.6f}, bacc={val_bacc:.6f}"
     )
     print(
         "test: "
-        f"acc={test_metrics[0]:.6f}, f1={test_metrics[1]:.6f}, auc={test_metrics[2]:.6f}, bac={test_metrics[3]:.6f}"
+        f"acc={test_metrics[0]:.6f}, f1={test_metrics[1]:.6f}, auc={test_metrics[2]:.6f}, "
+        f"bac={test_metrics[3]:.6f}, bacc={test_bacc:.6f}"
     )
     print(f"val_group_acc: {val_group_acc}")
     print(f"val_group_bac: {val_group_bac}")
+    print(f"val_group_bacc: {val_group_bacc}")
     print(f"test_group_acc: {test_group_acc}")
     print(f"test_group_bac: {test_group_bac}")
+    print(f"test_group_bacc: {test_group_bacc}")
     for line in format_group_class_lines(val_per_class, class_names, groups, "val"):
         print(line)
     for line in format_group_class_lines(test_per_class, class_names, groups, "test"):

@@ -7,6 +7,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import pandas as pd
 from torch.utils.data import DataLoader, Dataset
@@ -28,6 +29,7 @@ from utils.metrics import (
     append_per_class_records,
     build_group_specs,
     compute_avg_metrics,
+    compute_macro_metric,
     compute_per_class_metrics,
     format_tail_lines,
     plot_loss_curve,
@@ -36,7 +38,7 @@ from utils.metrics import (
     update_curve_history,
 )
 
-from models import ResNetBackbone, Projector, l2_normalize
+from models import ResNetBackbone, Projector
 from utils.losses import (
     balanced_softmax_loss,
     compute_batch_class_means,
@@ -44,9 +46,9 @@ from utils.losses import (
     ema_update_prototypes,
     enqueue_feature_queue,
     pcd_loss,
+    prototype_uniformity_loss,
     recalibrate_prototypes,
     sp_kd_loss,
-    var_preserve_loss,
 )
 
 
@@ -122,7 +124,37 @@ def evaluate(encoder, classifier, loader, device, num_classes):
     preds = torch.cat(preds, dim=0)
     acc, f1, auc, bac, sens, spec = compute_avg_metrics(gts, preds)
     per_class = compute_per_class_metrics(gts, preds, num_classes=num_classes)
-    return (acc, f1, auc, bac, sens, spec), per_class
+    bacc = compute_macro_metric(per_class, metric_key="bacc")
+    return (acc, f1, auc, bac, bacc, sens, spec), per_class
+
+
+def summarize_active_prototypes(prototypes, active_mask=None):
+    if active_mask is not None:
+        active_mask = active_mask.to(device=prototypes.device, dtype=torch.bool)
+        prototypes = prototypes[active_mask]
+    if prototypes.numel() == 0 or prototypes.shape[0] < 2:
+        return float("nan"), float("nan")
+
+    protos = F.normalize(prototypes, p=2, dim=1)
+    sim_matrix = torch.matmul(protos, protos.t())
+    off_diag_mask = ~torch.eye(sim_matrix.shape[0], device=sim_matrix.device, dtype=torch.bool)
+    off_diag = sim_matrix[off_diag_mask]
+    if off_diag.numel() == 0:
+        return float("nan"), float("nan")
+    return float(off_diag.mean().item()), float(off_diag.max().item())
+
+
+def linear_warmup_weight(epoch, target_weight, warmup_start_epoch, warmup_end_epoch):
+    target_weight = float(target_weight)
+    if target_weight <= 0.0:
+        return 0.0
+    if epoch <= warmup_start_epoch:
+        return 0.0
+    if epoch <= warmup_end_epoch:
+        span = max(1, int(warmup_end_epoch) - int(warmup_start_epoch))
+        ratio = (epoch - warmup_start_epoch) / float(span)
+        return target_weight * max(0.0, min(1.0, ratio))
+    return target_weight
 
 
 def main():
@@ -158,9 +190,12 @@ def main():
     parser.add_argument("--use_class_weight", action="store_true")
     parser.add_argument("--pcd_weight", type=float, default=1.0)
     parser.add_argument("--pcd_temp", type=float, default=0.05)
+    parser.add_argument("--pcd_margin", type=float, default=0.85)
     parser.add_argument("--spkd_weight", type=float, default=10.0)
-    parser.add_argument("--var_weight", type=float, default=0.2)
-    parser.add_argument("--var_beta", type=float, default=0.5)
+    parser.add_argument("--punif_weight", type=float, default=1.0)
+    parser.add_argument("--punif_t", type=float, default=2.0)
+    parser.add_argument("--punif_warmup_start_epoch", type=int, default=15)
+    parser.add_argument("--punif_warmup_end_epoch", type=int, default=30)
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--proto_momentum", type=float, default=0.96)
     parser.add_argument("--recal_interval", type=int, default=5)
@@ -201,8 +236,10 @@ def main():
         class_weights = None
     if args.cls_loss in {"balanced_softmax", "deferred_balanced_softmax"} and args.use_class_weight:
         raise ValueError("Balanced Softmax variants should not be combined with class-weighted CE.")
+    if args.punif_warmup_end_epoch < args.punif_warmup_start_epoch:
+        raise ValueError("punif_warmup_end_epoch must be greater than or equal to punif_warmup_start_epoch")
 
-    head_classes, medium_classes, tail_classes = split_groups(counts)
+    _, _, tail_classes = split_groups(counts)
     group_specs = build_group_specs(class_names, counts)
     tail_mask = torch.zeros(num_classes, dtype=torch.bool, device=device)
     tail_mask[tail_classes] = True
@@ -265,6 +302,7 @@ def main():
     student_queue = torch.zeros(args.queue_size, proj_dim, device=device)
     teacher_queue = torch.zeros(args.queue_size, proj_dim, device=device)
     label_queue = torch.full((args.queue_size,), -1, dtype=torch.long, device=device)
+    prototype_seen = torch.zeros(num_classes, dtype=torch.bool, device=device)
 
     best_val_acc = -1.0
     for epoch in range(1, args.epochs + 1):
@@ -272,12 +310,18 @@ def main():
         classifier.train()
         if projector is not None:
             projector.train()
+        current_punif_weight = linear_warmup_weight(
+            epoch,
+            args.punif_weight,
+            args.punif_warmup_start_epoch,
+            args.punif_warmup_end_epoch,
+        )
 
         loss_sum = 0.0
         cls_loss_sum = 0.0
         pcd_loss_sum = 0.0
         spkd_loss_sum = 0.0
-        var_loss_sum = 0.0
+        punif_loss_sum = 0.0
         for strong, weak, label in train_loader:
             strong = strong.to(device, non_blocking=True)
             weak = weak.to(device, non_blocking=True)
@@ -312,26 +356,34 @@ def main():
                 alpha = torch.sqrt(torch.clamp(nmax / torch.clamp(counts_tensor, min=1.0), min=1.0))
                 sample_weights = alpha[label]
 
+            batch_class_mean, valid_mask = compute_batch_class_means(z_s, label, num_classes)
+            active_proto_mask = prototype_seen | valid_mask
+            # Use detached memory as global context, but keep gradients on classes present in this batch.
+            proto_proxy = torch.where(
+                valid_mask.unsqueeze(1),
+                batch_class_mean,
+                prototypes.detach(),
+            )
+            punif_raw = prototype_uniformity_loss(proto_proxy, t=args.punif_t, active_mask=active_proto_mask)
+            punif = current_punif_weight * punif_raw
+
             valid_queue_mask = label_queue >= 0
             queue_student = student_queue[valid_queue_mask]
             queue_teacher = teacher_queue[valid_queue_mask]
-            queue_labels = label_queue[valid_queue_mask]
 
             enqueue_feature_queue(student_queue, z_s, label_queue=label_queue, labels=label)
             enqueue_feature_queue(teacher_queue, z_t)
 
-            z_s_norm = l2_normalize(z_s, dim=1)
-            pcd = pcd_loss(z_s, label, prototypes, temperature=args.pcd_temp, sample_weights=sample_weights)
+            pcd = pcd_loss(
+                z_s,
+                label,
+                prototypes,
+                temperature=args.pcd_temp,
+                sample_weights=sample_weights,
+                pcd_margin=args.pcd_margin,
+            )
             spkd = sp_kd_loss(z_s, z_t, student_memory=queue_student, teacher_memory=queue_teacher)
-            if queue_student.numel() > 0:
-                z_var_all = torch.cat([z_s_norm, l2_normalize(queue_student, dim=1)], dim=0)
-                label_var_all = torch.cat([label, queue_labels], dim=0)
-            else:
-                z_var_all = z_s_norm
-                label_var_all = label
-            var_loss = var_preserve_loss(z_var_all, label_var_all, head_classes, tail_classes, beta=args.var_beta)
-
-            loss = cls_loss + args.pcd_weight * pcd + args.spkd_weight * spkd + args.var_weight * var_loss
+            loss = cls_loss + args.pcd_weight * pcd + args.spkd_weight * spkd + punif
 
             optimizer.zero_grad()
             loss.backward()
@@ -341,7 +393,7 @@ def main():
             cls_loss_sum += cls_loss.item()
             pcd_loss_sum += args.pcd_weight * pcd.item()
             spkd_loss_sum += args.spkd_weight * spkd.item()
-            var_loss_sum += args.var_weight * var_loss.item()
+            punif_loss_sum += punif.item()
 
             # EMA update teacher
             with torch.no_grad():
@@ -353,7 +405,7 @@ def main():
 
             # Update prototypes
             with torch.no_grad():
-                batch_class_mean, valid_mask = compute_batch_class_means(z_s.detach(), label, num_classes)
+                batch_class_mean = batch_class_mean.detach()
                 prototypes = ema_update_prototypes(
                     prototypes, batch_class_mean, valid_mask, momentum=args.proto_momentum
                 )
@@ -365,16 +417,21 @@ def main():
                         tail_mask=tail_mask,
                         alpha=args.recal_alpha,
                     )
+                prototype_seen |= valid_mask
 
         train_loss = loss_sum / max(1, len(train_loader))
         train_cls_loss = cls_loss_sum / max(1, len(train_loader))
         train_pcd_loss = pcd_loss_sum / max(1, len(train_loader))
         train_spkd_loss = spkd_loss_sum / max(1, len(train_loader))
-        train_var_loss = var_loss_sum / max(1, len(train_loader))
+        train_punif_loss = punif_loss_sum / max(1, len(train_loader))
+        proto_mean_cos, proto_max_cos = summarize_active_prototypes(prototypes.detach(), prototype_seen)
+        proto_uniformity_eval = prototype_uniformity_loss(
+            prototypes.detach(), t=args.punif_t, active_mask=prototype_seen
+        ).item()
         val_metrics, val_per_class = evaluate(encoder, classifier, val_loader, device, num_classes)
         test_metrics, test_per_class = evaluate(encoder, classifier, test_loader, device, num_classes)
-        val_acc, val_f1, val_auc, val_bac, val_sens, val_spec = val_metrics
-        test_acc, test_f1, test_auc, test_bac, test_sens, test_spec = test_metrics
+        val_acc, val_f1, val_auc, val_bac, val_bacc, val_sens, val_spec = val_metrics
+        test_acc, test_f1, test_auc, test_bac, test_bacc, test_sens, test_spec = test_metrics
 
         append_per_class_records(per_class_csv, epoch, "val", val_per_class, class_names)
         append_per_class_records(per_class_csv, epoch, "test", test_per_class, class_names)
@@ -391,9 +448,13 @@ def main():
             f"loss_cls={train_cls_loss:.6f} "
             f"loss_pcd={train_pcd_loss:.6f} "
             f"loss_spkd={train_spkd_loss:.6f} "
-            f"loss_var={train_var_loss:.6f} "
-            f"val_acc={val_acc:.6f} val_bac={val_bac:.6f} "
-            f"test_acc={test_acc:.6f} test_bac={test_bac:.6f}"
+            f"loss_punif={train_punif_loss:.6f} "
+            f"punif_w={current_punif_weight:.6f} "
+            f"proto_unif={proto_uniformity_eval:.6f} "
+            f"proto_mean_cos={proto_mean_cos:.6f} "
+            f"proto_max_cos={proto_max_cos:.6f} "
+            f"val_acc={val_acc:.6f} val_bac={val_bac:.6f} val_bacc={val_bacc:.6f} "
+            f"test_acc={test_acc:.6f} test_bac={test_bac:.6f} test_bacc={test_bacc:.6f}"
         )
         print(log_line)
         with open(log_path, "a", encoding="utf-8") as f:

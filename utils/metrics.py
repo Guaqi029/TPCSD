@@ -53,7 +53,9 @@ def compute_per_class_metrics(ground_truth, activations, num_classes=None):
         spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-        bac = 0.5 * (recall + spec)
+        # Use recall-only definition to keep all long-tail metrics on the same axis.
+        bac = recall
+        bacc = 0.5 * (recall + spec)
 
         y_true_bin = (ground_truth == c).astype(np.int32)
         y_score = activations[:, c]
@@ -74,12 +76,26 @@ def compute_per_class_metrics(ground_truth, activations, num_classes=None):
                 "f1": float(f1),
                 "auc": float(auc),
                 "bac": float(bac),
+                "bacc": float(bacc),
                 "sens": float(recall),
                 "spec": float(spec),
                 "precision": float(precision),
             }
         )
     return per_class
+
+
+def compute_macro_metric(per_class_metrics, metric_key):
+    if per_class_metrics is None:
+        return float("nan")
+    values = []
+    for row in per_class_metrics:
+        val = float(row.get(metric_key, float("nan")))
+        if not np.isnan(val):
+            values.append(val)
+    if not values:
+        return float("nan")
+    return float(np.mean(values))
 
 
 def build_group_specs(class_names, class_counts):
@@ -110,7 +126,7 @@ def build_group_lookup(groups):
     return lookup
 
 
-def compute_group_metric(per_class_metrics, groups, metric_key="acc", weighted=True):
+def compute_group_metric(per_class_metrics, groups, metric_key="acc", weighted=False):
     if per_class_metrics is None or groups is None:
         return None
     metric_map = {int(row["class_id"]): float(row.get(metric_key, float("nan"))) for row in per_class_metrics}
@@ -162,7 +178,7 @@ def format_tail_lines(per_class_metrics, class_names, tail_classes, split_name):
             (
                 f"{split_name}_tail {class_names[int(class_id)]}: "
                 f"acc={row['acc']:.4f}, recall={row['recall']:.4f}, f1={row['f1']:.4f}, "
-                f"bac={row['bac']:.4f}, n={row['support']}"
+                f"bac={row['bac']:.4f}, bacc={row['bacc']:.4f}, n={row['support']}"
             )
         )
     return lines
@@ -181,7 +197,7 @@ def format_group_class_lines(per_class_metrics, class_names, groups, split_name)
                 (
                     f"  {class_names[int(class_id)]}: "
                     f"acc={row['acc']:.4f}, recall={row['recall']:.4f}, f1={row['f1']:.4f}, "
-                    f"bac={row['bac']:.4f}, n={row['support']}"
+                    f"bac={row['bac']:.4f}, bacc={row['bacc']:.4f}, n={row['support']}"
                 )
             )
     return lines

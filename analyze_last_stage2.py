@@ -12,12 +12,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from data.dataset import ISICDataset
 from data.transforms import Transforms
-from models import Projector, ResNetBackbone
+from models import CosineClassifier, Projector, ResNetBackbone
 from utils.checkpoint_utils import load_state_dict_flexible
 from utils.csv_utils import label_frame_to_int
 from utils.metrics import (
     build_group_specs,
     compute_avg_metrics,
+    compute_macro_metric,
     compute_group_metric,
     compute_per_class_metrics,
     format_tail_lines,
@@ -82,6 +83,17 @@ def compute_class_stats(feats, labels, num_classes):
     return mu, sigma
 
 
+def compute_shared_covariance(feats, labels, mu, jitter=1e-4):
+    if feats.numel() == 0:
+        return torch.eye(mu.shape[1], dtype=mu.dtype)
+    centered = feats - mu.index_select(0, labels.long())
+    denom = max(int(centered.shape[0]) - 1, 1)
+    cov = centered.t().matmul(centered) / float(denom)
+    cov = 0.5 * (cov + cov.t())
+    cov = cov + torch.eye(cov.shape[0], dtype=cov.dtype) * float(jitter)
+    return cov
+
+
 def compute_per_class_acc(classifier, feats, labels, num_classes, device):
     classifier.eval()
     with torch.no_grad():
@@ -108,7 +120,25 @@ def softmax_alloc(acc, alpha, total):
     return counts, weights
 
 
-def sample_virtual_features(mu_tilde, sigma, prototypes, counts, gamma=0.2, delta=0.01):
+def sample_virtual_features_shared_cov(mu_tilde, shared_cov, counts, delta=0.01, cov_scale_factor=1.0):
+    feats = []
+    labels = []
+    base_cov = shared_cov * float(cov_scale_factor)
+    base_cov = base_cov + torch.eye(shared_cov.shape[0], device=shared_cov.device, dtype=shared_cov.dtype) * (float(delta) ** 2)
+    for class_id in range(mu_tilde.shape[0]):
+        k = int(counts[class_id].item())
+        if k <= 0:
+            continue
+        mvn = torch.distributions.MultivariateNormal(loc=mu_tilde[class_id], covariance_matrix=base_cov)
+        z = mvn.sample((k,))
+        feats.append(z)
+        labels.append(torch.full((k,), class_id, dtype=torch.long, device=mu_tilde.device))
+    if not feats:
+        return torch.empty(0, mu_tilde.shape[1], device=mu_tilde.device), torch.empty(0, dtype=torch.long, device=mu_tilde.device)
+    return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
+
+
+def sample_virtual_features_diag(mu_tilde, sigma, prototypes, counts, gamma=0.2, delta=0.01):
     feats = []
     labels = []
     for class_id in range(mu_tilde.shape[0]):
@@ -152,6 +182,27 @@ def infer_projector_dims(projector_ckpt, feat_dim, default_proj_dim, default_hid
     return True, default_proj_dim, default_hidden_dim
 
 
+def infer_classifier_head(classifier_ckpt, feature_dim, num_classes, default_cosine_scale):
+    state = torch.load(classifier_ckpt, map_location="cpu")
+    if isinstance(state, dict):
+        for key in ("state_dict", "model", "model_state_dict"):
+            if key in state and isinstance(state[key], dict):
+                state = state[key]
+                break
+    if not isinstance(state, dict):
+        raise ValueError(f"unsupported classifier checkpoint format: {classifier_ckpt}")
+
+    state = {(key[7:] if key.startswith("module.") else key): value for key, value in state.items()}
+    if "bias" in state:
+        return nn.Linear(feature_dim, num_classes).to(torch.device("cpu")), "linear"
+
+    scale = float(default_cosine_scale)
+    if "scale" in state:
+        scale_value = state["scale"]
+        scale = float(scale_value.item() if torch.is_tensor(scale_value) else scale_value)
+    return CosineClassifier(feature_dim, num_classes, scale=scale).to(torch.device("cpu")), "cosine"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
@@ -166,6 +217,7 @@ def main():
     parser.add_argument("--prototype_ckpt", default="")
     parser.add_argument("--gaussian_mu_ckpt", default="")
     parser.add_argument("--gaussian_sigma_ckpt", default="")
+    parser.add_argument("--shared_cov_ckpt", default="")
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--workers", type=int, default=8)
@@ -173,11 +225,13 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--proj_dim", type=int, default=128)
     parser.add_argument("--proj_hidden_dim", type=int, default=0)
-    parser.add_argument("--aas_alpha", type=float, default=1.0)
+    parser.add_argument("--aas_alpha", type=float, default=2.0)
     parser.add_argument("--virtual_ratio", type=float, default=1.0)
-    parser.add_argument("--lambda_mu", type=float, default=0.7)
+    parser.add_argument("--lambda_mu", type=float, default=0.5)
     parser.add_argument("--gamma_proto", type=float, default=0.2)
     parser.add_argument("--delta_noise", type=float, default=0.01)
+    parser.add_argument("--cov_scale_factor", type=float, default=1.0)
+    parser.add_argument("--cosine_scale", type=float, default=16.0)
     parser.add_argument("--output_dir", default="")
     args = parser.parse_args()
 
@@ -229,7 +283,10 @@ def main():
         load_state_dict_flexible(projector, args.projector_ckpt)
         feature_dim = inferred_proj_dim
 
-    classifier = nn.Linear(feature_dim, len(class_names)).to(device)
+    classifier, classifier_type = infer_classifier_head(
+        args.classifier_ckpt, feature_dim, len(class_names), args.cosine_scale
+    )
+    classifier = classifier.to(device)
     load_state_dict_flexible(classifier, args.classifier_ckpt)
 
     train_feats, train_labels = extract_features(encoder, projector, train_loader, device)
@@ -240,6 +297,10 @@ def main():
         mu = torch.load(args.gaussian_mu_ckpt, map_location="cpu").float()
     else:
         mu, _ = compute_class_stats(train_feats, train_labels, len(class_names))
+    if args.shared_cov_ckpt and os.path.isfile(args.shared_cov_ckpt):
+        shared_cov = torch.load(args.shared_cov_ckpt, map_location="cpu").float()
+    else:
+        shared_cov = compute_shared_covariance(train_feats, train_labels, mu)
     if args.gaussian_sigma_ckpt and os.path.isfile(args.gaussian_sigma_ckpt):
         sigma = torch.load(args.gaussian_sigma_ckpt, map_location="cpu").float()
     else:
@@ -252,6 +313,7 @@ def main():
 
     mu = mu.to(device)
     sigma = sigma.to(device)
+    shared_cov = shared_cov.to(device)
     prototypes = prototypes.to(device)
     mu_tilde = args.lambda_mu * mu + (1.0 - args.lambda_mu) * prototypes
 
@@ -260,9 +322,18 @@ def main():
     train_acc = compute_per_class_acc(classifier, train_feats, train_labels, len(class_names), device)
     virtual_total = int(len(train_labels) * float(args.virtual_ratio))
     alloc, alloc_weights = softmax_alloc(train_acc, args.aas_alpha, virtual_total)
-    virt_feats, virt_labels = sample_virtual_features(
-        mu_tilde, sigma, prototypes, alloc, gamma=args.gamma_proto, delta=args.delta_noise
-    )
+    if args.shared_cov_ckpt and os.path.isfile(args.shared_cov_ckpt):
+        virt_feats, virt_labels = sample_virtual_features_shared_cov(
+            mu_tilde,
+            shared_cov,
+            alloc,
+            delta=args.delta_noise,
+            cov_scale_factor=args.cov_scale_factor,
+        )
+    else:
+        virt_feats, virt_labels = sample_virtual_features_diag(
+            mu_tilde, sigma, prototypes, alloc, gamma=args.gamma_proto, delta=args.delta_noise
+        )
 
     quality_rows = []
     for class_id, class_name in enumerate(class_names):
@@ -368,21 +439,27 @@ def main():
         "prototype_ckpt": args.prototype_ckpt,
         "gaussian_mu_ckpt": args.gaussian_mu_ckpt,
         "gaussian_sigma_ckpt": args.gaussian_sigma_ckpt,
+        "shared_cov_ckpt": args.shared_cov_ckpt,
+        "classifier_type": classifier_type,
         "val": {
             "acc": float(val_metrics[0]),
             "f1": float(val_metrics[1]),
             "auc": float(val_metrics[2]),
             "bac": float(val_metrics[3]),
+            "bacc": float(compute_macro_metric(val_per_class, metric_key="bacc")),
             "group_acc": compute_group_metric(val_per_class, groups, metric_key="acc"),
             "group_bac": compute_group_metric(val_per_class, groups, metric_key="bac"),
+            "group_bacc": compute_group_metric(val_per_class, groups, metric_key="bacc"),
         },
         "test": {
             "acc": float(test_metrics[0]),
             "f1": float(test_metrics[1]),
             "auc": float(test_metrics[2]),
             "bac": float(test_metrics[3]),
+            "bacc": float(compute_macro_metric(test_per_class, metric_key="bacc")),
             "group_acc": compute_group_metric(test_per_class, groups, metric_key="acc"),
             "group_bac": compute_group_metric(test_per_class, groups, metric_key="bac"),
+            "group_bacc": compute_group_metric(test_per_class, groups, metric_key="bacc"),
         },
         "virtual_total": int(virtual_total),
     }
@@ -391,11 +468,13 @@ def main():
 
     print(
         "val: "
-        f"acc={val_metrics[0]:.6f}, f1={val_metrics[1]:.6f}, auc={val_metrics[2]:.6f}, bac={val_metrics[3]:.6f}"
+        f"acc={val_metrics[0]:.6f}, f1={val_metrics[1]:.6f}, auc={val_metrics[2]:.6f}, "
+        f"bac={val_metrics[3]:.6f}, bacc={compute_macro_metric(val_per_class, metric_key='bacc'):.6f}"
     )
     print(
         "test: "
-        f"acc={test_metrics[0]:.6f}, f1={test_metrics[1]:.6f}, auc={test_metrics[2]:.6f}, bac={test_metrics[3]:.6f}"
+        f"acc={test_metrics[0]:.6f}, f1={test_metrics[1]:.6f}, auc={test_metrics[2]:.6f}, "
+        f"bac={test_metrics[3]:.6f}, bacc={compute_macro_metric(test_per_class, metric_key='bacc'):.6f}"
     )
     for line in format_tail_lines(val_per_class, class_names, tail_classes, "val"):
         print(line)

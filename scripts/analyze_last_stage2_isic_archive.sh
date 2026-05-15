@@ -50,7 +50,9 @@ python analyze_last_stage2.py \
   --classifier_ckpt "${STAGE2_RUN_DIR}/classifier_latest.pth" \
   --gaussian_mu_ckpt "${STAGE2_RUN_DIR}/gaussian_mu_latest.pth" \
   --gaussian_sigma_ckpt "${STAGE2_RUN_DIR}/gaussian_sigma_latest.pth" \
-  --backbone resnet50 \
+  --shared_cov_ckpt "${STAGE2_RUN_DIR}/shared_cov_latest.pth" \
+  --cov_scale_factor 1.0 \
+  --backbone resnet18 \
   --image_size "${IMAGE_SIZE}" \
   --batch_size "${BATCH_SIZE}" \
   --workers "${NUM_WORKERS}"

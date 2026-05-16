@@ -158,6 +158,37 @@ def sample_virtual_features_diag(mu_tilde, sigma, prototypes, counts, gamma=0.2,
     return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
 
 
+
+
+def summarize_gaussian_stats(mu, shared_cov):
+    mu_norms = torch.norm(mu, p=2, dim=1)
+    mu_norm_mean = float(mu_norms.mean().item())
+    mu_norm_std = float(mu_norms.std(unbiased=False).item())
+
+    cov_diag = torch.diag(shared_cov)
+    cov_trace = float(cov_diag.sum().item())
+    cov_diag_mean = float(cov_diag.mean().item())
+    cov_fro = float(torch.norm(shared_cov, p="fro").item())
+
+    eigvals = torch.linalg.eigvalsh(shared_cov)
+    eig_min = float(eigvals.min().item())
+    eig_max = float(eigvals.max().item())
+
+    cond = float("inf")
+    if eig_min > 1e-12:
+        cond = eig_max / eig_min
+
+    return {
+        "mu_norm_mean": mu_norm_mean,
+        "mu_norm_std": mu_norm_std,
+        "cov_trace": cov_trace,
+        "cov_diag_mean": cov_diag_mean,
+        "cov_fro": cov_fro,
+        "cov_eig_min": eig_min,
+        "cov_eig_max": eig_max,
+        "cov_cond": cond,
+    }
+
 def evaluate_classifier(classifier, feats, labels, device, num_classes):
     classifier.eval()
     with torch.no_grad():
@@ -314,6 +345,19 @@ def main():
     mu = mu.to(device)
     sigma = sigma.to(device)
     shared_cov = shared_cov.to(device)
+
+    stats = summarize_gaussian_stats(mu, shared_cov)
+    print(
+        "Gaussian stats: "
+        f"mu_norm_mean={stats['mu_norm_mean']:.6f} "
+        f"mu_norm_std={stats['mu_norm_std']:.6f} "
+        f"cov_trace={stats['cov_trace']:.6f} "
+        f"cov_diag_mean={stats['cov_diag_mean']:.6f} "
+        f"cov_fro={stats['cov_fro']:.6f} "
+        f"cov_eig_min={stats['cov_eig_min']:.6e} "
+        f"cov_eig_max={stats['cov_eig_max']:.6e} "
+        f"cov_cond={stats['cov_cond']:.6e}"
+    )
     prototypes = prototypes.to(device)
     mu_tilde = args.lambda_mu * mu + (1.0 - args.lambda_mu) * prototypes
 

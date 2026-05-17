@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import time
 import random
@@ -175,6 +176,45 @@ def sample_virtual_features(mu, shared_cov, counts, delta=0.01, cov_scale_factor
     return feats, labels
 
 
+
+
+def summarize_gaussian_stats(mu, shared_cov):
+    mu_norms = torch.norm(mu, p=2, dim=1)
+    mu_norm_mean = float(mu_norms.mean().item())
+    mu_norm_std = float(mu_norms.std(unbiased=False).item())
+
+    cov_diag = torch.diag(shared_cov)
+    cov_trace = float(cov_diag.sum().item())
+    cov_diag_mean = float(cov_diag.mean().item())
+    cov_fro = float(torch.norm(shared_cov, p="fro").item())
+
+    eigvals = torch.linalg.eigvalsh(shared_cov)
+    eig_min = float(eigvals.min().item())
+    eig_max = float(eigvals.max().item())
+
+    cond = float("inf")
+    if eig_min > 1e-12:
+        cond = eig_max / eig_min
+
+    return {
+        "mu_norm_mean": mu_norm_mean,
+        "mu_norm_std": mu_norm_std,
+        "cov_trace": cov_trace,
+        "cov_diag_mean": cov_diag_mean,
+        "cov_fro": cov_fro,
+        "cov_eig_min": eig_min,
+        "cov_eig_max": eig_max,
+        "cov_cond": cond,
+    }
+
+
+def gaussian_stats_delta(curr, prev):
+    if prev is None:
+        return None
+    out = {}
+    for k, v in curr.items():
+        out[k] = float(v - prev[k])
+    return out
 def evaluate_classifier(classifier, feats, labels, device, num_classes):
     classifier.eval()
     with torch.no_grad():
@@ -215,6 +255,8 @@ def main():
     parser.add_argument("--aas_alpha", type=float, default=2.0)
     parser.add_argument("--virtual_ratio", type=float, default=1.0)
     parser.add_argument("--merge_real", action="store_true")
+    parser.add_argument("--recompute_with_virtual", action="store_true")
+    parser.add_argument("--train_noise_std", type=float, default=0.0)
     parser.add_argument("--use_class_weight", action="store_true")
     parser.add_argument("--cosine_scale", type=float, default=16.0)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -291,6 +333,18 @@ def main():
     os.makedirs(args.log_dir, exist_ok=True)
     log_path = os.path.join(args.log_dir, f"{os.path.basename(ckpt_root)}.log")
     per_class_csv = os.path.join(ckpt_root, "per_class_metrics.csv")
+    gaussian_stats_csv = os.path.join(ckpt_root, "gaussian_stats_history.csv")
+    with open(gaussian_stats_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "epoch",
+            "mu_norm_mean", "mu_norm_std",
+            "cov_trace", "cov_diag_mean", "cov_fro",
+            "cov_eig_min", "cov_eig_max", "cov_cond",
+            "d_mu_norm_mean", "d_mu_norm_std",
+            "d_cov_trace", "d_cov_diag_mean", "d_cov_fro",
+            "d_cov_eig_min", "d_cov_eig_max", "d_cov_cond",
+        ])
     curve_history = {
         "train": {"epoch": [], "loss": []},
         "val": {"epoch": [], "acc": [], "bac": []},
@@ -298,6 +352,9 @@ def main():
     }
 
     prototypes = torch.load(args.prototype_ckpt, map_location="cpu").float()
+
+    best_val_acc = -1.0
+    prev_stats = None
 
     for epoch in range(1, args.epochs + 1):
         # Extract real features
@@ -312,6 +369,9 @@ def main():
         sigma = sigma.to(device)
         shared_cov = shared_cov.to(device)
 
+        stats = summarize_gaussian_stats(mu, shared_cov)
+        delta_stats = gaussian_stats_delta(stats, prev_stats)
+
         proto = prototypes.to(device)
         if proto.shape[1] != mu.shape[1]:
             raise ValueError("prototype dimension mismatch with feature dim")
@@ -322,7 +382,7 @@ def main():
         total_virtual = int(len(train_labels) * float(args.virtual_ratio))
         alloc, weights = softmax_alloc(per_class_acc, args.aas_alpha, total_virtual)
 
-        # Sample virtual features
+        # Sample virtual features (first pass from real-only stats)
         virt_feats, virt_labels = sample_virtual_features(
             mu_tilde,
             shared_cov,
@@ -331,9 +391,37 @@ def main():
             cov_scale_factor=args.cov_scale_factor,
         )
 
+        real_feats_dev = train_feats.to(device)
+        real_labels_dev = train_labels.to(device)
+
+        # Optional closed-loop recompute: recompute mu/cov from real + virtual,
+        # then resample virtual features from mixed stats.
+        if args.recompute_with_virtual and virt_feats.numel() > 0:
+            mix_feats = torch.cat([real_feats_dev, virt_feats], dim=0)
+            mix_labels = torch.cat([real_labels_dev, virt_labels], dim=0)
+
+            mu_mix, sigma_mix = compute_class_stats(mix_feats.detach().cpu(), mix_labels.detach().cpu(), num_classes)
+            shared_cov_mix = compute_shared_covariance(mix_feats.detach().cpu(), mix_labels.detach().cpu(), mu_mix)
+
+            mu = mu_mix.to(device)
+            sigma = sigma_mix.to(device)
+            shared_cov = shared_cov_mix.to(device)
+
+            stats = summarize_gaussian_stats(mu, shared_cov)
+            delta_stats = gaussian_stats_delta(stats, prev_stats)
+
+            mu_tilde = args.lambda_mu * mu + (1.0 - args.lambda_mu) * proto
+            virt_feats, virt_labels = sample_virtual_features(
+                mu_tilde,
+                shared_cov,
+                alloc,
+                delta=args.delta_noise,
+                cov_scale_factor=args.cov_scale_factor,
+            )
+
         if args.merge_real:
-            feats = torch.cat([train_feats.to(device), virt_feats], dim=0)
-            labels = torch.cat([train_labels.to(device), virt_labels], dim=0)
+            feats = torch.cat([real_feats_dev, virt_feats], dim=0)
+            labels = torch.cat([real_labels_dev, virt_labels], dim=0)
         else:
             feats = virt_feats
             labels = virt_labels
@@ -344,6 +432,8 @@ def main():
         loader = DataLoader(dataset, batch_size=args.stage2_batch_size, shuffle=True, drop_last=False)
         loss_sum = 0.0
         for x, y in loader:
+            if args.train_noise_std > 0:
+                x = x + args.train_noise_std * torch.randn_like(x)
             logits = classifier(x)
             loss = nn.functional.cross_entropy(logits, y, weight=class_weights)
             optimizer.zero_grad()
@@ -372,15 +462,72 @@ def main():
             f"val_acc={val_metrics[0]:.6f} val_bac={val_metrics[3]:.6f} val_bacc={val_metrics[4]:.6f} "
             f"test_acc={test_metrics[0]:.6f} test_bac={test_metrics[3]:.6f} test_bacc={test_metrics[4]:.6f}"
         )
+
+        gaussian_line = (
+            "Gaussian stats: "
+            f"mu_norm_mean={stats['mu_norm_mean']:.6f} "
+            f"mu_norm_std={stats['mu_norm_std']:.6f} "
+            f"cov_trace={stats['cov_trace']:.6f} "
+            f"cov_diag_mean={stats['cov_diag_mean']:.6f} "
+            f"cov_fro={stats['cov_fro']:.6f} "
+            f"cov_eig_min={stats['cov_eig_min']:.6e} "
+            f"cov_eig_max={stats['cov_eig_max']:.6e} "
+            f"cov_cond={stats['cov_cond']:.6e}"
+        )
+
+        if delta_stats is None:
+            gaussian_delta_line = "Gaussian delta: init"
+        else:
+            gaussian_delta_line = (
+                "Gaussian delta: "
+                f"d_mu_norm_mean={delta_stats['mu_norm_mean']:+.6e} "
+                f"d_mu_norm_std={delta_stats['mu_norm_std']:+.6e} "
+                f"d_cov_trace={delta_stats['cov_trace']:+.6e} "
+                f"d_cov_diag_mean={delta_stats['cov_diag_mean']:+.6e} "
+                f"d_cov_fro={delta_stats['cov_fro']:+.6e} "
+                f"d_cov_eig_min={delta_stats['cov_eig_min']:+.6e} "
+                f"d_cov_eig_max={delta_stats['cov_eig_max']:+.6e} "
+                f"d_cov_cond={delta_stats['cov_cond']:+.6e}"
+            )
         print(log_line)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(log_line + "\n")
             for line in format_tail_lines(val_per_class, train_base.class_names, tail_classes, "val"):
                 print(line)
                 f.write(line + "\n")
+            print(gaussian_line)
+            f.write(gaussian_line + "\n")
+            print(gaussian_delta_line)
+            f.write(gaussian_delta_line + "\n")
             for line in format_tail_lines(test_per_class, train_base.class_names, tail_classes, "test"):
                 print(line)
                 f.write(line + "\n")
+
+        prev_stats = stats
+
+        with open(gaussian_stats_csv, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch,
+                stats["mu_norm_mean"], stats["mu_norm_std"],
+                stats["cov_trace"], stats["cov_diag_mean"], stats["cov_fro"],
+                stats["cov_eig_min"], stats["cov_eig_max"], stats["cov_cond"],
+                (float("nan") if delta_stats is None else delta_stats["mu_norm_mean"]),
+                (float("nan") if delta_stats is None else delta_stats["mu_norm_std"]),
+                (float("nan") if delta_stats is None else delta_stats["cov_trace"]),
+                (float("nan") if delta_stats is None else delta_stats["cov_diag_mean"]),
+                (float("nan") if delta_stats is None else delta_stats["cov_fro"]),
+                (float("nan") if delta_stats is None else delta_stats["cov_eig_min"]),
+                (float("nan") if delta_stats is None else delta_stats["cov_eig_max"]),
+                (float("nan") if delta_stats is None else delta_stats["cov_cond"]),
+            ])
+
+        if val_metrics[0] > best_val_acc:
+            best_val_acc = val_metrics[0]
+            torch.save(unwrap_model(classifier).state_dict(), os.path.join(ckpt_root, "classifier_best.pth"))
+            torch.save(mu.cpu(), os.path.join(ckpt_root, "gaussian_mu_best.pth"))
+            torch.save(sigma.cpu(), os.path.join(ckpt_root, "gaussian_sigma_best.pth"))
+            torch.save(shared_cov.cpu(), os.path.join(ckpt_root, "shared_cov_best.pth"))
 
         torch.save(unwrap_model(classifier).state_dict(), os.path.join(ckpt_root, "classifier_latest.pth"))
         torch.save(mu.cpu(), os.path.join(ckpt_root, "gaussian_mu_latest.pth"))

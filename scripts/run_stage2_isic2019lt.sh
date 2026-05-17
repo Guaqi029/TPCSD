@@ -20,6 +20,8 @@ BATCH_SIZE="${BATCH_SIZE:-256}"
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-2048}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 EPOCHS="${EPOCHS:-100}"
+TRAIN_NOISE_STD="${TRAIN_NOISE_STD:-0.01}"
+RECOMPUTE_WITH_VIRTUAL="${RECOMPUTE_WITH_VIRTUAL:-1}"
 STAGE1_RUN_DIR="${STAGE1_RUN_DIR:-}"
 CKPT_TAG="${CKPT_TAG:-best}"
 
@@ -47,6 +49,12 @@ PROJECTOR_CKPT="${STAGE1_RUN_DIR}/projector_${CKPT_TAG}.pth"
 [[ -f "${PROTOTYPE_CKPT}" ]] || { echo "Missing prototype_ckpt: ${PROTOTYPE_CKPT}" >&2; exit 1; }
 
 TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
+if [[ "${RECOMPUTE_WITH_VIRTUAL}" == "1" || "${RECOMPUTE_WITH_VIRTUAL}" == "true" || "${RECOMPUTE_WITH_VIRTUAL}" == "True" ]]; then
+  set -- --recompute_with_virtual
+else
+  set --
+fi
+
 RUN_NAME="run_tpcsd_stage2_isic2019lt_if${FACTOR}_${TIMESTAMP}"
 
 python train_stage2.py \
@@ -77,4 +85,6 @@ python train_stage2.py \
   --cov_scale_factor 1.0 \
   --cosine_scale 16.0 \
   --lr 1e-3 \
-  --delta_noise 0.01
+  --delta_noise 0.01 \
+  --train_noise_std "${TRAIN_NOISE_STD}" \
+  "$@"

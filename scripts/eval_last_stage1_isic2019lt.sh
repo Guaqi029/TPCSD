@@ -41,7 +41,7 @@ python eval_last_stage1.py \
   --csv_file_test "${TEST_CSV}" \
   --encoder_ckpt "${RUN_DIR}/resnet_encoder_${CKPT_TAG}.pth" \
   --classifier_ckpt "${RUN_DIR}/classifier_${CKPT_TAG}.pth" \
-  --backbone resnet18 \
+  --backbone medclip_vit \
   --image_size "${IMAGE_SIZE}" \
   --batch_size "${BATCH_SIZE}" \
   --workers "${NUM_WORKERS}"

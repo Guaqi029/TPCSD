@@ -72,7 +72,7 @@ python train_stage2.py \
   --workers "${NUM_WORKERS}" \
   --image_size "${IMAGE_SIZE}" \
   --seed "${SEED}" \
-  --backbone resnet18 \
+  --backbone medclip_vit \
   --use_projector \
   --proj_dim 128 \
   --encoder_ckpt "${ENCODER_CKPT}" \

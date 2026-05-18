@@ -40,7 +40,7 @@ python analyze_prototype_alignment.py \
   --encoder_ckpt "${RUN_DIR}/resnet_encoder_latest.pth" \
   --projector_ckpt "${PROJECTOR_CKPT}" \
   --prototype_ckpt "${RUN_DIR}/prototype_memory_latest.pth" \
-  --backbone resnet18 \
+  --backbone medclip_vit \
   --image_size "${IMAGE_SIZE}" \
   --batch_size "${BATCH_SIZE}" \
   --workers "${NUM_WORKERS}"

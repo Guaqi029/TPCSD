@@ -54,7 +54,7 @@ python analyze_last_stage2.py \
   --gaussian_sigma_ckpt "${STAGE2_RUN_DIR}/gaussian_sigma_${STAGE2_CKPT_TAG}.pth" \
   --shared_cov_ckpt "${STAGE2_RUN_DIR}/shared_cov_${STAGE2_CKPT_TAG}.pth" \
   --cov_scale_factor 1.0 \
-  --backbone resnet18 \
+  --backbone medclip_vit \
   --image_size "${IMAGE_SIZE}" \
   --batch_size "${BATCH_SIZE}" \
   --workers "${NUM_WORKERS}"

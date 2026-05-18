@@ -52,7 +52,7 @@ python train_stage1.py \
   --workers "${NUM_WORKERS}" \
   --image_size "${IMAGE_SIZE}" \
   --seed "${SEED}" \
-  --backbone resnet18 \
+  --backbone medclip_vit \
   "${PRETRAIN_FLAG}" \
   --cls_loss ce \
   --pcd_weight 0.0 \

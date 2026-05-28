@@ -38,7 +38,7 @@ from utils.metrics import (
     update_curve_history,
 )
 
-from models import ResNetBackbone, Projector
+from models import ResNetBackbone
 from utils.losses import (
     balanced_softmax_loss,
     compute_batch_class_means,
@@ -47,7 +47,6 @@ from utils.losses import (
     enqueue_feature_queue,
     pcd_loss,
     prototype_nearest_neighbor_separation_loss,
-    prototype_uniformity_loss,
     recalibrate_prototypes,
     sp_kd_loss,
 )
@@ -176,9 +175,6 @@ def main():
     parser.add_argument("--backbone", default="resnet50")
     parser.add_argument("--pretrained", dest="pretrained", action="store_true")
     parser.add_argument("--no-pretrained", dest="pretrained", action="store_false")
-    parser.add_argument("--use_projector", action="store_true")
-    parser.add_argument("--proj_dim", type=int, default=128)
-    parser.add_argument("--proj_hidden_dim", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--momentum", type=float, default=0.9)
@@ -250,44 +246,22 @@ def main():
     encoder = ResNetBackbone(args.backbone, pretrained=args.pretrained)
     feat_dim = encoder.feat_dim
     classifier = nn.Linear(feat_dim, num_classes)
-    projector = None
-    proj_dim = feat_dim
-    if args.use_projector:
-        projector = Projector(feat_dim, proj_dim=args.proj_dim, hidden_dim=args.proj_hidden_dim)
-        proj_dim = args.proj_dim
 
     encoder = encoder.to(device)
     classifier = classifier.to(device)
-    if projector is not None:
-        projector = projector.to(device)
 
     encoder_teacher = ResNetBackbone(args.backbone, pretrained=args.pretrained).to(device)
-    if projector is not None:
-        projector_teacher = Projector(feat_dim, proj_dim=args.proj_dim, hidden_dim=args.proj_hidden_dim).to(device)
-    else:
-        projector_teacher = None
 
     encoder_teacher.load_state_dict(encoder.state_dict())
-    if projector is not None:
-        projector_teacher.load_state_dict(projector.state_dict())
     for p in encoder_teacher.parameters():
         p.requires_grad = False
-    if projector_teacher is not None:
-        for p in projector_teacher.parameters():
-            p.requires_grad = False
 
     if torch.cuda.device_count() > 1:
         encoder = nn.DataParallel(encoder)
         classifier = nn.DataParallel(classifier)
-        if projector is not None:
-            projector = nn.DataParallel(projector)
         encoder_teacher = nn.DataParallel(encoder_teacher)
-        if projector_teacher is not None:
-            projector_teacher = nn.DataParallel(projector_teacher)
 
     optim_params = list(encoder.parameters()) + list(classifier.parameters())
-    if projector is not None:
-        optim_params += list(projector.parameters())
     optimizer = optim.SGD(optim_params, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
     ckpt_root = os.path.join(args.checkpoints, args.run_name or f"run_tpcsd_{int(time.time())}")
@@ -301,9 +275,9 @@ def main():
         "test": {"epoch": [], "acc": [], "bac": []},
     }
 
-    prototypes = torch.zeros(num_classes, proj_dim, device=device)
-    student_queue = torch.zeros(args.queue_size, proj_dim, device=device)
-    teacher_queue = torch.zeros(args.queue_size, proj_dim, device=device)
+    prototypes = torch.zeros(num_classes, feat_dim, device=device)
+    student_queue = torch.zeros(args.queue_size, feat_dim, device=device)
+    teacher_queue = torch.zeros(args.queue_size, feat_dim, device=device)
     label_queue = torch.full((args.queue_size,), -1, dtype=torch.long, device=device)
     prototype_seen = torch.zeros(num_classes, dtype=torch.bool, device=device)
 
@@ -311,8 +285,6 @@ def main():
     for epoch in range(1, args.epochs + 1):
         encoder.train()
         classifier.train()
-        if projector is not None:
-            projector.train()
         current_punif_weight = linear_warmup_weight(
             epoch,
             args.punif_weight,
@@ -332,17 +304,11 @@ def main():
 
             feat_s = encoder(strong)
             logits_s = classifier(feat_s)
-            if projector is not None:
-                z_s = projector(feat_s)
-            else:
-                z_s = feat_s
+            z_s = feat_s
 
             with torch.no_grad():
                 feat_t = encoder_teacher(weak)
-                if projector_teacher is not None:
-                    z_t = projector_teacher(feat_t)
-                else:
-                    z_t = feat_t
+                z_t = feat_t
 
             if args.cls_loss == "balanced_softmax":
                 cls_loss = balanced_softmax_loss(logits_s, label, counts_tensor)
@@ -406,9 +372,6 @@ def main():
             with torch.no_grad():
                 for t_param, s_param in zip(encoder_teacher.parameters(), encoder.parameters()):
                     t_param.data.mul_(args.ema_decay).add_(s_param.data, alpha=1.0 - args.ema_decay)
-                if projector_teacher is not None and projector is not None:
-                    for t_param, s_param in zip(projector_teacher.parameters(), projector.parameters()):
-                        t_param.data.mul_(args.ema_decay).add_(s_param.data, alpha=1.0 - args.ema_decay)
 
             # Update prototypes
             with torch.no_grad():
@@ -480,28 +443,20 @@ def main():
             best_val_acc = val_acc
             torch.save(encoder.state_dict(), os.path.join(ckpt_root, "resnet_encoder_best.pth"))
             torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_best.pth"))
-            if projector is not None:
-                torch.save(projector.state_dict(), os.path.join(ckpt_root, "projector_best.pth"))
             torch.save(prototypes, os.path.join(ckpt_root, "prototype_memory_best.pth"))
 
         if args.cls_loss == "deferred_balanced_softmax":
             if args.cls_warmup_epochs > 1 and epoch == args.cls_warmup_epochs - 1:
                 torch.save(encoder.state_dict(), os.path.join(ckpt_root, "resnet_encoder_pre_switch.pth"))
                 torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_pre_switch.pth"))
-                if projector is not None:
-                    torch.save(projector.state_dict(), os.path.join(ckpt_root, "projector_pre_switch.pth"))
                 torch.save(prototypes, os.path.join(ckpt_root, "prototype_memory_pre_switch.pth"))
             if epoch == args.cls_warmup_epochs:
                 torch.save(encoder.state_dict(), os.path.join(ckpt_root, "resnet_encoder_switch_epoch.pth"))
                 torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_switch_epoch.pth"))
-                if projector is not None:
-                    torch.save(projector.state_dict(), os.path.join(ckpt_root, "projector_switch_epoch.pth"))
                 torch.save(prototypes, os.path.join(ckpt_root, "prototype_memory_switch_epoch.pth"))
 
         torch.save(encoder.state_dict(), os.path.join(ckpt_root, "resnet_encoder_latest.pth"))
         torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_latest.pth"))
-        if projector is not None:
-            torch.save(projector.state_dict(), os.path.join(ckpt_root, "projector_latest.pth"))
         torch.save(prototypes, os.path.join(ckpt_root, "prototype_memory_latest.pth"))
 
 

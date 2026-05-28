@@ -20,7 +20,7 @@ bash scripts/run_stage1_isic_archive.sh
 ```
 
 ## Stage 2 (PG-AVFC)
-Stage 2 freezes the Stage 1 encoder and projector, extracts 128-d projected features, fits class-wise Gaussian statistics, samples virtual features around the fused class centers, and retrains only a linear classifier. The recommended scripts run the no-`class_weight` baseline and require the saved Stage 1 encoder, projector, and prototype checkpoints.
+Stage 2 freezes the Stage 1 encoder, works directly in the encoder feature space, fits class-wise Gaussian statistics, samples virtual features around the fused class centers, and retrains only a cosine classifier. The recommended scripts run the no-`class_weight` baseline and require the saved Stage 1 encoder and prototype checkpoints. Older projector-space Stage 1 checkpoints are not compatible with the current Stage 2.
 
 ISIC2019LT:
 ```
@@ -52,7 +52,6 @@ bash scripts/analyze_last_stage2_isic_archive.sh
 Checkpoints are saved under `./checkpoints/<run_name>`:
 - `resnet_encoder_latest.pth`
 - `classifier_latest.pth`
-- `projector_latest.pth` (if projector enabled)
 - `prototype_memory_latest.pth`
 
 Logs under `./log/tpcsd`.

@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from data.dataset import ISICDataset
 from data.transforms import Transforms
-from models import Projector, ResNetBackbone
+from models import ResNetBackbone
 from utils.checkpoint_utils import load_state_dict_flexible
 from utils.losses import prototype_uniformity_loss
 from utils.metrics import build_group_specs
@@ -38,31 +38,14 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def infer_projector_dims(projector_ckpt, feat_dim, default_proj_dim, default_hidden_dim):
-    if not projector_ckpt or not os.path.isfile(projector_ckpt):
-        return False, feat_dim, 0
-    state = torch.load(projector_ckpt, map_location="cpu")
-    if "net.weight" in state:
-        return True, int(state["net.weight"].shape[0]), 0
-    if "net.0.weight" in state and "net.2.weight" in state:
-        hidden_dim = int(state["net.0.weight"].shape[0])
-        proj_dim = int(state["net.2.weight"].shape[0])
-        return True, proj_dim, hidden_dim
-    return True, default_proj_dim, default_hidden_dim
-
-
-def extract_features(encoder, projector, loader, device):
+def extract_features(encoder, loader, device):
     encoder.eval()
-    if projector is not None:
-        projector.eval()
     feats = []
     labels = []
     with torch.no_grad():
         for image, label in loader:
             image = image.to(device)
             feat = encoder(image)
-            if projector is not None:
-                feat = projector(feat)
             feats.append(feat.detach().cpu())
             labels.append(label.detach().cpu())
     return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
@@ -155,14 +138,11 @@ def main():
     parser.add_argument("--encoder_ckpt", required=True)
     parser.add_argument("--prototype_ckpt", required=True)
     parser.add_argument("--backbone", default="resnet50")
-    parser.add_argument("--projector_ckpt", default="")
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--proj_dim", type=int, default=128)
-    parser.add_argument("--proj_hidden_dim", type=int, default=0)
     parser.add_argument("--output_dir", default="")
     args = parser.parse_args()
 
@@ -181,24 +161,16 @@ def main():
 
     encoder = ResNetBackbone(args.backbone, pretrained=False).to(device)
     load_state_dict_flexible(encoder, args.encoder_ckpt)
-
-    use_projector, inferred_proj_dim, inferred_hidden_dim = infer_projector_dims(
-        args.projector_ckpt, encoder.feat_dim, args.proj_dim, args.proj_hidden_dim
-    )
-    projector = None
     feature_dim = encoder.feat_dim
-    if use_projector:
-        projector = Projector(encoder.feat_dim, proj_dim=inferred_proj_dim, hidden_dim=inferred_hidden_dim).to(device)
-        load_state_dict_flexible(projector, args.projector_ckpt)
-        feature_dim = inferred_proj_dim
 
     prototypes = torch.load(args.prototype_ckpt, map_location="cpu").float()
     if prototypes.shape[1] != feature_dim:
         raise ValueError(
-            f"prototype dim mismatch: checkpoint={prototypes.shape[1]}, expected={feature_dim}"
+            "prototype dim mismatch with encoder output dimension. "
+            "Prototype-alignment analysis now expects projector-free Stage1 checkpoints."
         )
 
-    feats, labels = extract_features(encoder, projector, train_loader, device)
+    feats, labels = extract_features(encoder, train_loader, device)
     means, stds = compute_class_stats(feats, labels, train_base.n_class)
 
     prototypes_n = F.normalize(prototypes, dim=1)
@@ -313,7 +285,6 @@ def main():
     summary = {
         "dataset": args.dataset,
         "encoder_ckpt": args.encoder_ckpt,
-        "projector_ckpt": args.projector_ckpt,
         "prototype_ckpt": args.prototype_ckpt,
         "mean_proto_mean_cosine": float(np.mean([row["proto_mean_cosine"] for row in rows])),
         "min_proto_mean_cosine": float(np.min([row["proto_mean_cosine"] for row in rows])),

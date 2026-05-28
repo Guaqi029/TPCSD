@@ -63,6 +63,16 @@ def _resolve_medclip_vision_model_dir():
     return _first_hf_model_dir(candidates)
 
 
+def _resolve_medclip_vision_config_dir():
+    candidates = [
+        os.environ.get("MEDCLIP_VISION_MODEL_DIR", "").strip(),
+        os.environ.get("MEDCLIP_VIT_DIR", "").strip(),
+        os.path.join(_repo_root(), "pretrained", "medclip-vit"),
+        _hf_snapshot_dir("microsoft/swin-tiny-patch4-window7-224"),
+    ]
+    return _first_hf_model_dir(candidates)
+
+
 def _resolve_medclip_weights_path():
     candidates = [
         os.environ.get("MEDCLIP_VIT_WEIGHTS_PATH", "").strip(),
@@ -106,6 +116,34 @@ def _load_medclip_vision_weights(vision_model, ckpt_path):
         )
 
     vision_model.load_state_dict(vision_state, strict=False)
+
+
+class LocalMedCLIPVisionModelViT(nn.Module):
+    def __init__(self, config_dir):
+        super().__init__()
+        try:
+            from transformers import SwinConfig, SwinModel
+        except Exception as e:
+            raise ImportError(
+                "transformers is required to build the local MedCLIP ViT fallback."
+            ) from e
+
+        if not config_dir or not os.path.isfile(os.path.join(config_dir, "config.json")):
+            raise FileNotFoundError(
+                "Missing local Swin config.json for MedCLIP ViT fallback. "
+                "Populate pretrained/medclip-vit/config.json or set MEDCLIP_VISION_MODEL_DIR."
+            )
+
+        config = SwinConfig.from_pretrained(config_dir, local_files_only=True)
+        self.model = SwinModel(config)
+        self.projection_head = nn.Linear(int(config.hidden_size), 512, bias=False)
+
+    def forward(self, pixel_values):
+        outputs = self.model(pixel_values)
+        pooled = getattr(outputs, "pooler_output", None)
+        if pooled is None:
+            pooled = outputs.last_hidden_state.mean(dim=1)
+        return self.projection_head(pooled)
 
 
 class ResNetBackbone(nn.Module):
@@ -169,30 +207,33 @@ class ResNetBackbone(nn.Module):
             self.pool = net.avgpool
 
         elif name == "medclip_vit":
-            try:
-                from medclip import MedCLIPVisionModelViT
-            except Exception as e:
-                raise ImportError(
-                    "medclip is required for backbone='medclip_vit'. "
-                    "Install with `pip install medclip` or the MedCLIP GitHub package."
-                ) from e
-
             vision_checkpoint = _resolve_medclip_vision_model_dir()
-            init_kwargs = {}
-            if vision_checkpoint:
-                init_kwargs["checkpoint"] = vision_checkpoint
+            ckpt_path = _resolve_medclip_weights_path()
+            vision_model = None
+            medclip_error = None
 
-            try:
-                self.vision_model = MedCLIPVisionModelViT(**init_kwargs)
-            except OSError as e:
-                raise OSError(
-                    "Failed to initialize MedCLIP ViT without internet access. "
-                    "Set MEDCLIP_VISION_MODEL_DIR (or MEDCLIP_VIT_DIR) to a local Hugging Face model directory "
-                    "for microsoft/swin-tiny-patch4-window7-224, or populate the HF cache before running offline."
-                ) from e
+            if vision_checkpoint:
+                try:
+                    from medclip import MedCLIPVisionModelViT
+
+                    vision_model = MedCLIPVisionModelViT(checkpoint=vision_checkpoint)
+                except Exception as e:
+                    medclip_error = e
+
+            if vision_model is None:
+                config_dir = _resolve_medclip_vision_config_dir()
+                try:
+                    vision_model = LocalMedCLIPVisionModelViT(config_dir=config_dir)
+                except Exception as e:
+                    raise OSError(
+                        "Failed to initialize MedCLIP ViT offline. Provide a local Hugging Face Swin directory via "
+                        "MEDCLIP_VISION_MODEL_DIR (or MEDCLIP_VIT_DIR), or ensure pretrained/medclip-vit contains "
+                        "config.json plus the MedCLIP vision checkpoint."
+                    ) from (medclip_error or e)
+
+            self.vision_model = vision_model
 
             if pretrained:
-                ckpt_path = _resolve_medclip_weights_path()
                 if not ckpt_path:
                     raise FileNotFoundError(
                         "Could not find MedCLIP weights. Set MEDCLIP_WEIGHTS_PATH or place the checkpoint at "

@@ -447,13 +447,8 @@ def main():
     projector = Projector(feat_dim, proj_dim=args.proj_dim, hidden_dim=args.proj_hidden_dim)
     load_state_dict_compat(projector, args.projector_ckpt)
     projector = projector.to(device)
-    projector.train()
-
-    projector_anchor = Projector(feat_dim, proj_dim=args.proj_dim, hidden_dim=args.proj_hidden_dim)
-    load_state_dict_compat(projector_anchor, args.projector_ckpt)
-    projector_anchor = projector_anchor.to(device)
-    projector_anchor.eval()
-    for p in projector_anchor.parameters():
+    projector.eval()
+    for p in projector.parameters():
         p.requires_grad = False
 
     prototypes = torch.load(args.prototype_ckpt, map_location="cpu").float()
@@ -471,7 +466,6 @@ def main():
     optimizer = optim.SGD(
         [
             {"params": classifier.parameters(), "lr": args.lr},
-            {"params": projector.parameters(), "lr": args.projector_lr},
         ],
         weight_decay=args.weight_decay,
         momentum=0.9,
@@ -483,6 +477,10 @@ def main():
     log_path = os.path.join(args.log_dir, f"{os.path.basename(ckpt_root)}.log")
     per_class_csv = os.path.join(ckpt_root, "per_class_metrics.csv")
     gaussian_stats_csv = os.path.join(ckpt_root, "gaussian_stats_history.csv")
+    stage2_mode_line = (
+        "Stage2 mode: projector is frozen; projector_lr and anchor_weight are retained "
+        "for CLI compatibility but ignored during optimization."
+    )
     with open(gaussian_stats_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -503,12 +501,15 @@ def main():
     best_val_acc = -1.0
     prev_stats = None
     proto = prototypes.to(device)
+    train_proj_feats = project_feature_tensor(projector, train_backbone_feats, device, args.stage2_batch_size)
+    val_proj_feats = project_feature_tensor(projector, val_backbone_feats, device, args.stage2_batch_size)
+    test_proj_feats = project_feature_tensor(projector, test_backbone_feats, device, args.stage2_batch_size)
+
+    print(stage2_mode_line)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(stage2_mode_line + "\n")
 
     for epoch in range(1, args.epochs + 1):
-        train_proj_feats = project_feature_tensor(projector, train_backbone_feats, device, args.stage2_batch_size)
-        val_proj_feats = project_feature_tensor(projector, val_backbone_feats, device, args.stage2_batch_size)
-        test_proj_feats = project_feature_tensor(projector, test_backbone_feats, device, args.stage2_batch_size)
-
         mu_real, sigma_real = compute_class_stats(train_proj_feats, train_labels, num_classes)
         shared_cov_real = compute_shared_covariance(train_proj_feats, train_labels, mu_real)
         mu = mu_real.to(device)
@@ -578,7 +579,7 @@ def main():
         stats = summarize_gaussian_stats(mu, shared_cov)
         delta_stats = gaussian_stats_delta(stats, prev_stats)
 
-        real_dataset = TensorDataset(train_backbone_feats, train_labels)
+        real_dataset = TensorDataset(train_proj_feats, train_labels)
         real_loader = DataLoader(
             real_dataset,
             batch_size=args.stage2_batch_size,
@@ -596,12 +597,10 @@ def main():
         else:
             virtual_loader = None
 
-        projector.train()
         classifier.train()
         loss_sum = 0.0
         real_cls_sum = 0.0
         virtual_cls_sum = 0.0
-        anchor_sum = 0.0
         step_count = 0
         real_iter = iter(real_loader)
         virtual_iter = iter(virtual_loader) if virtual_loader is not None else None
@@ -615,16 +614,13 @@ def main():
             real_x = real_x.to(device)
             real_y = real_y.to(device)
 
-            real_proj = projector(real_x)
-            real_anchor = projector_anchor(real_x).detach()
-            real_proj_for_cls = real_proj
+            real_proj_for_cls = real_x
             if args.train_noise_std > 0:
                 real_proj_for_cls = real_proj_for_cls + args.train_noise_std * torch.randn_like(real_proj_for_cls)
             real_logits = classifier(real_proj_for_cls)
             real_cls_loss = nn.functional.cross_entropy(real_logits, real_y, weight=class_weights)
-            anchor_loss = projector_anchor_loss(real_proj, real_anchor)
 
-            loss = real_cls_loss + args.anchor_weight * anchor_loss
+            loss = real_cls_loss
             virt_cls_loss = real_cls_loss.new_tensor(0.0)
 
             if virt_batch is not None:
@@ -644,18 +640,15 @@ def main():
             loss_sum += loss.item()
             real_cls_sum += real_cls_loss.item()
             virtual_cls_sum += virt_cls_loss.item()
-            anchor_sum += anchor_loss.item()
             step_count += 1
 
-        val_proj_feats = project_feature_tensor(projector, val_backbone_feats, device, args.stage2_batch_size)
-        test_proj_feats = project_feature_tensor(projector, test_backbone_feats, device, args.stage2_batch_size)
         val_metrics, val_per_class = evaluate_classifier(classifier, val_proj_feats, val_labels, device, num_classes)
         test_metrics, test_per_class = evaluate_classifier(classifier, test_proj_feats, test_labels, device, num_classes)
 
         train_loss = loss_sum / max(1, step_count)
         train_real_loss = real_cls_sum / max(1, step_count)
         train_virtual_loss = virtual_cls_sum / max(1, step_count)
-        train_anchor_loss = anchor_sum / max(1, step_count)
+        train_anchor_loss = 0.0
         hardest_names = [train_base.class_names[int(idx)] for idx in hardest_indices.tolist()]
 
         append_per_class_records(per_class_csv, epoch, "val", val_per_class, train_base.class_names)

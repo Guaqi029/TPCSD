@@ -19,3 +19,7 @@ export MEDCLIP_VIT_WEIGHTS_PATH="${MEDCLIP_VIT_WEIGHTS_PATH:-${MEDCLIP_WEIGHTS_P
 if [[ -z "${MEDCLIP_VISION_MODEL_DIR:-}" && -f "${REPO_ROOT}/pretrained/medclip-vit/config.json" ]]; then
   export MEDCLIP_VISION_MODEL_DIR="${REPO_ROOT}/pretrained/medclip-vit"
 fi
+
+if [[ -z "${MEDCLIP_VIT_DIR:-}" && -n "${MEDCLIP_VISION_MODEL_DIR:-}" ]]; then
+  export MEDCLIP_VIT_DIR="${MEDCLIP_VISION_MODEL_DIR}"
+fi

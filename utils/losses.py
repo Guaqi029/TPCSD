@@ -86,6 +86,24 @@ def prototype_uniformity_loss(prototypes, t=2.0, active_mask=None):
     return torch.logsumexp(float(t) * off_diag, dim=0) - math.log(off_diag.numel())
 
 
+def prototype_nearest_neighbor_separation_loss(prototypes, margin=0.5, active_mask=None):
+    if prototypes.numel() == 0:
+        return prototypes.new_tensor(0.0)
+
+    if active_mask is not None:
+        active_mask = active_mask.to(device=prototypes.device, dtype=torch.bool)
+        prototypes = prototypes[active_mask]
+
+    if prototypes.numel() == 0 or prototypes.shape[0] < 2:
+        return prototypes.new_tensor(0.0)
+
+    prototypes = F.normalize(prototypes, p=2, dim=1)
+    sim_matrix = torch.matmul(prototypes, prototypes.t())
+    sim_matrix.fill_diagonal_(-1.0)
+    nearest_neighbor_sim, _ = sim_matrix.max(dim=1)
+    return torch.clamp(nearest_neighbor_sim - float(margin), min=0.0).mean()
+
+
 def pcd_loss(z, labels, prototypes, temperature=0.07, sample_weights=None, pcd_margin=0.85):
     if z.numel() == 0:
         return z.new_tensor(0.0)

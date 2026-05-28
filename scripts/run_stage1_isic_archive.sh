@@ -6,6 +6,7 @@ shopt -s nullglob
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+source "${SCRIPT_DIR}/common_medclip_env.sh"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3}"
 
@@ -20,6 +21,8 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 EPOCHS="${EPOCHS:-100}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
 PRETRAINED="${PRETRAINED:-True}"
+RECAL_TAIL_FACTOR="${RECAL_TAIL_FACTOR:-1.0}"
+PROTO_SEP_MARGIN="${PROTO_SEP_MARGIN:-0.5}"
 
 TRAIN_CSV="${SPLIT_DIR}/training.csv"
 VAL_CSV="${SPLIT_DIR}/validation.csv"
@@ -62,10 +65,11 @@ python train_stage1.py \
   --pcd_margin 0.85 \
   --spkd_weight 10.0 \
   --punif_weight 1.0 \
-  --punif_t 2.0 \
-  --punif_warmup_start_epoch 15 \
-  --punif_warmup_end_epoch 30 \
+  --proto_sep_margin "${PROTO_SEP_MARGIN}" \
+  --punif_warmup_start_epoch 40 \
+  --punif_warmup_end_epoch 60 \
   --proto_momentum 0.96 \
   --recal_interval 5 \
   --recal_alpha 0.15 \
+  --recal_tail_factor "${RECAL_TAIL_FACTOR}" \
   --queue_size 1024

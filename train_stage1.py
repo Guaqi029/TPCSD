@@ -46,6 +46,7 @@ from utils.losses import (
     ema_update_prototypes,
     enqueue_feature_queue,
     pcd_loss,
+    prototype_nearest_neighbor_separation_loss,
     prototype_uniformity_loss,
     recalibrate_prototypes,
     sp_kd_loss,
@@ -194,12 +195,14 @@ def main():
     parser.add_argument("--spkd_weight", type=float, default=10.0)
     parser.add_argument("--punif_weight", type=float, default=1.0)
     parser.add_argument("--punif_t", type=float, default=2.0)
+    parser.add_argument("--proto_sep_margin", type=float, default=0.5)
     parser.add_argument("--punif_warmup_start_epoch", type=int, default=15)
     parser.add_argument("--punif_warmup_end_epoch", type=int, default=30)
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--proto_momentum", type=float, default=0.96)
     parser.add_argument("--recal_interval", type=int, default=5)
     parser.add_argument("--recal_alpha", type=float, default=0.15)
+    parser.add_argument("--recal_tail_factor", type=float, default=1.5)
     parser.add_argument("--tail_alpha", action="store_true")
     parser.add_argument("--queue_size", type=int, default=1024)
     parser.add_argument("--device", default="cuda")
@@ -364,7 +367,11 @@ def main():
                 batch_class_mean,
                 prototypes.detach(),
             )
-            punif_raw = prototype_uniformity_loss(proto_proxy, t=args.punif_t, active_mask=active_proto_mask)
+            punif_raw = prototype_nearest_neighbor_separation_loss(
+                proto_proxy,
+                margin=args.proto_sep_margin,
+                active_mask=active_proto_mask,
+            )
             punif = current_punif_weight * punif_raw
 
             valid_queue_mask = label_queue >= 0
@@ -416,6 +423,7 @@ def main():
                         valid_mask,
                         tail_mask=tail_mask,
                         alpha=args.recal_alpha,
+                        tail_factor=args.recal_tail_factor,
                     )
                 prototype_seen |= valid_mask
 
@@ -425,8 +433,10 @@ def main():
         train_spkd_loss = spkd_loss_sum / max(1, len(train_loader))
         train_punif_loss = punif_loss_sum / max(1, len(train_loader))
         proto_mean_cos, proto_max_cos = summarize_active_prototypes(prototypes.detach(), prototype_seen)
-        proto_uniformity_eval = prototype_uniformity_loss(
-            prototypes.detach(), t=args.punif_t, active_mask=prototype_seen
+        proto_uniformity_eval = prototype_nearest_neighbor_separation_loss(
+            prototypes.detach(),
+            margin=args.proto_sep_margin,
+            active_mask=prototype_seen,
         ).item()
         val_metrics, val_per_class = evaluate(encoder, classifier, val_loader, device, num_classes)
         test_metrics, test_per_class = evaluate(encoder, classifier, test_loader, device, num_classes)

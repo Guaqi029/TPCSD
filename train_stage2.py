@@ -1,13 +1,14 @@
 import argparse
 import csv
 import os
-import time
 import random
+import time
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
@@ -24,8 +25,8 @@ from utils.metrics import (
     format_tail_lines,
     plot_loss_curve,
     plot_group_curves,
-    update_loss_history,
     update_curve_history,
+    update_loss_history,
 )
 
 
@@ -80,23 +81,30 @@ def build_class_weights(train_csv, device):
     return weights, counts
 
 
-def extract_features(encoder, projector, loader, device):
+def extract_backbone_features(encoder, loader, device):
     encoder.eval()
-    if projector is not None:
-        projector.eval()
     feats = []
     labels = []
     with torch.no_grad():
         for img, label in loader:
             img = img.to(device)
             feat = encoder(img)
-            if projector is not None:
-                feat = projector(feat)
             feats.append(feat.detach().cpu())
             labels.append(label.detach().cpu())
     feats = torch.cat(feats, dim=0)
     labels = torch.cat(labels, dim=0)
     return feats, labels
+
+
+def project_feature_tensor(projector, feats, device, batch_size):
+    projector.eval()
+    projected = []
+    with torch.no_grad():
+        for start in range(0, feats.shape[0], batch_size):
+            end = min(start + batch_size, feats.shape[0])
+            batch = feats[start:end].to(device)
+            projected.append(projector(batch).detach().cpu())
+    return torch.cat(projected, dim=0)
 
 
 def compute_class_stats(feats, labels, num_classes):
@@ -124,7 +132,7 @@ def compute_shared_covariance(feats, labels, mu, jitter=1e-4):
     return cov
 
 
-def compute_per_class_acc(classifier, feats, labels, num_classes, device):
+def compute_classifier_per_class_acc(classifier, feats, labels, num_classes, device):
     classifier.eval()
     with torch.no_grad():
         x = feats.to(device)
@@ -141,16 +149,52 @@ def compute_per_class_acc(classifier, feats, labels, num_classes, device):
     return acc
 
 
-def softmax_alloc(acc, alpha, total):
-    scores = torch.exp(alpha * (1.0 - acc))
-    weights = scores / scores.sum()
-    counts = torch.floor(weights * float(total)).to(torch.long)
-    # fix rounding to match total
-    diff = int(total - counts.sum().item())
+def compute_prototype_per_class_acc(feats, labels, prototypes, num_classes, device):
+    with torch.no_grad():
+        x = F.normalize(feats.to(device), p=2, dim=1)
+        proto = F.normalize(prototypes.to(device), p=2, dim=1)
+        pred = torch.matmul(x, proto.t()).argmax(dim=1).cpu()
+    acc = torch.zeros(num_classes, dtype=torch.float32)
+    for c in range(num_classes):
+        idx = labels == c
+        if idx.sum() == 0:
+            acc[c] = 0.0
+        else:
+            acc[c] = (pred[idx] == c).float().mean().item()
+    return acc
+
+
+def select_hardest_classes(per_class_acc, hardest_k, hardest_fraction):
+    num_classes = int(per_class_acc.shape[0])
+    if hardest_k > 0:
+        k = min(num_classes, int(hardest_k))
+    else:
+        hardest_fraction = float(hardest_fraction)
+        k = int(np.ceil(num_classes * hardest_fraction))
+        k = max(1, min(num_classes, k))
+    order = torch.argsort(per_class_acc, descending=False)
+    return order[:k]
+
+
+def allocate_hardest_virtual_counts(per_class_acc, hardest_indices, alpha, total):
+    counts = torch.zeros_like(per_class_acc, dtype=torch.long)
+    weights = torch.zeros_like(per_class_acc, dtype=torch.float32)
+    total = int(total)
+    if total <= 0 or hardest_indices.numel() == 0:
+        return counts, weights
+
+    hardest_acc = per_class_acc[hardest_indices]
+    scores = torch.exp(float(alpha) * (1.0 - hardest_acc))
+    hardest_weights = scores / scores.sum()
+    hardest_counts = torch.floor(hardest_weights * float(total)).to(torch.long)
+    diff = int(total - hardest_counts.sum().item())
     if diff > 0:
-        order = torch.argsort(weights, descending=True)
+        order = torch.argsort(hardest_weights, descending=True)
         for i in range(diff):
-            counts[order[i % len(order)]] += 1
+            hardest_counts[order[i % len(order)]] += 1
+
+    counts[hardest_indices] = hardest_counts
+    weights[hardest_indices] = hardest_weights
     return counts, weights
 
 
@@ -176,6 +220,58 @@ def sample_virtual_features(mu, shared_cov, counts, delta=0.01, cov_scale_factor
     return feats, labels
 
 
+def filter_virtual_features(
+    virtual_feats,
+    virtual_labels,
+    classifier,
+    class_centers,
+    device,
+    conf_thresh,
+    center_cos_thresh,
+    batch_size,
+):
+    total = int(virtual_labels.shape[0])
+    if total == 0:
+        return (
+            torch.empty(0, virtual_feats.shape[1], dtype=virtual_feats.dtype),
+            torch.empty(0, dtype=torch.long),
+            total,
+            0,
+        )
+
+    classifier.eval()
+    kept_feats = []
+    kept_labels = []
+    norm_centers = F.normalize(class_centers.to(device), p=2, dim=1)
+
+    with torch.no_grad():
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            z = virtual_feats[start:end].to(device)
+            y = virtual_labels[start:end].to(device)
+            logits = classifier(z)
+            probs = torch.softmax(logits, dim=1)
+            conf, pred = probs.max(dim=1)
+            center_cos = F.cosine_similarity(
+                F.normalize(z, p=2, dim=1),
+                norm_centers.index_select(0, y),
+                dim=1,
+            )
+            keep = pred.eq(y) & (conf >= float(conf_thresh)) & (center_cos >= float(center_cos_thresh))
+            if torch.any(keep):
+                kept_feats.append(z[keep].detach().cpu())
+                kept_labels.append(y[keep].detach().cpu())
+
+    if not kept_feats:
+        return (
+            torch.empty(0, virtual_feats.shape[1], dtype=virtual_feats.dtype),
+            torch.empty(0, dtype=torch.long),
+            total,
+            0,
+        )
+    feats = torch.cat(kept_feats, dim=0)
+    labels = torch.cat(kept_labels, dim=0)
+    return feats, labels, total, int(labels.shape[0])
 
 
 def summarize_gaussian_stats(mu, shared_cov):
@@ -215,6 +311,14 @@ def gaussian_stats_delta(curr, prev):
     for k, v in curr.items():
         out[k] = float(v - prev[k])
     return out
+
+
+def projector_anchor_loss(projected, projected_anchor, eps=1e-12):
+    projected = F.normalize(projected, p=2, dim=1, eps=eps)
+    projected_anchor = F.normalize(projected_anchor, p=2, dim=1, eps=eps)
+    return (1.0 - F.cosine_similarity(projected, projected_anchor, dim=1)).mean()
+
+
 def evaluate_classifier(classifier, feats, labels, device, num_classes):
     classifier.eval()
     with torch.no_grad():
@@ -224,6 +328,17 @@ def evaluate_classifier(classifier, feats, labels, device, num_classes):
     per_class = compute_per_class_metrics(labels, probs, num_classes=num_classes)
     bacc = compute_macro_metric(per_class, metric_key="bacc")
     return (acc, f1, auc, bac, bacc, sens, spec), per_class
+
+
+def next_batch(loader, iterator):
+    if loader is None:
+        return None, iterator
+    try:
+        batch = next(iterator)
+    except StopIteration:
+        iterator = iter(loader)
+        batch = next(iterator)
+    return batch, iterator
 
 
 def main():
@@ -255,14 +370,27 @@ def main():
     parser.add_argument("--aas_alpha", type=float, default=2.0)
     parser.add_argument("--virtual_ratio", type=float, default=1.0)
     parser.add_argument("--merge_real", action="store_true")
-    parser.add_argument("--recompute_with_virtual", action="store_true")
     parser.add_argument("--train_noise_std", type=float, default=0.0)
     parser.add_argument("--use_class_weight", action="store_true")
     parser.add_argument("--cosine_scale", type=float, default=16.0)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--projector_lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--hardest_k", type=int, default=3)
+    parser.add_argument("--hardest_fraction", type=float, default=0.5)
+    parser.add_argument("--virtual_conf_thresh", type=float, default=0.6)
+    parser.add_argument("--virtual_center_cos_thresh", type=float, default=0.2)
+    parser.add_argument("--anchor_weight", type=float, default=0.05)
+    parser.add_argument("--virtual_loss_weight", type=float, default=1.0)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+
+    if not args.merge_real:
+        raise ValueError("Stage2 projector fine-tuning expects --merge_real so real features remain in training.")
+    if args.hardest_k < 0:
+        raise ValueError("hardest_k must be >= 0")
+    if args.hardest_k == 0 and not (0.0 < float(args.hardest_fraction) <= 1.0):
+        raise ValueError("hardest_fraction must be in (0, 1] when hardest_k is 0")
 
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -297,12 +425,6 @@ def main():
 
     encoder = ResNetBackbone(args.backbone, pretrained=False)
     feat_dim = encoder.feat_dim
-    projector = None
-    proj_dim = feat_dim
-    if args.use_projector:
-        projector = Projector(feat_dim, proj_dim=args.proj_dim, hidden_dim=args.proj_hidden_dim)
-        proj_dim = args.proj_dim
-
     if not os.path.isfile(args.encoder_ckpt):
         raise FileNotFoundError(f"encoder_ckpt not found: {args.encoder_ckpt}")
     load_state_dict_compat(encoder, args.encoder_ckpt)
@@ -311,22 +433,49 @@ def main():
     for p in encoder.parameters():
         p.requires_grad = False
 
-    if projector is not None:
-        load_state_dict_compat(projector, args.projector_ckpt)
-        projector = projector.to(device)
-        projector.eval()
-        for p in projector.parameters():
-            p.requires_grad = False
-
-    classifier = CosineClassifier(proj_dim, num_classes, scale=args.cosine_scale).to(device)
-
     if device.type == "cuda" and torch.cuda.device_count() > 1:
         encoder = nn.DataParallel(encoder)
-        classifier = nn.DataParallel(classifier)
-        if projector is not None:
-            projector = nn.DataParallel(projector)
 
-    optimizer = optim.SGD(classifier.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=0.9)
+    train_backbone_feats, train_labels = extract_backbone_features(encoder, train_loader, device)
+    val_backbone_feats, val_labels = extract_backbone_features(encoder, val_loader, device)
+    test_backbone_feats, test_labels = extract_backbone_features(encoder, test_loader, device)
+
+    del encoder
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    projector = Projector(feat_dim, proj_dim=args.proj_dim, hidden_dim=args.proj_hidden_dim)
+    load_state_dict_compat(projector, args.projector_ckpt)
+    projector = projector.to(device)
+    projector.train()
+
+    projector_anchor = Projector(feat_dim, proj_dim=args.proj_dim, hidden_dim=args.proj_hidden_dim)
+    load_state_dict_compat(projector_anchor, args.projector_ckpt)
+    projector_anchor = projector_anchor.to(device)
+    projector_anchor.eval()
+    for p in projector_anchor.parameters():
+        p.requires_grad = False
+
+    prototypes = torch.load(args.prototype_ckpt, map_location="cpu").float()
+    if prototypes.shape[1] != args.proj_dim:
+        raise ValueError("prototype dimension mismatch with projector output dimension")
+
+    classifier = CosineClassifier(args.proj_dim, num_classes, scale=args.cosine_scale).to(device)
+    with torch.no_grad():
+        classifier.weight.copy_(prototypes.to(device))
+
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        projector = nn.DataParallel(projector)
+        classifier = nn.DataParallel(classifier)
+
+    optimizer = optim.SGD(
+        [
+            {"params": classifier.parameters(), "lr": args.lr},
+            {"params": projector.parameters(), "lr": args.projector_lr},
+        ],
+        weight_decay=args.weight_decay,
+        momentum=0.9,
+    )
 
     ckpt_root = os.path.join(args.checkpoints, args.run_name or f"run_tpcsd_stage2_{int(time.time())}")
     os.makedirs(ckpt_root, exist_ok=True)
@@ -351,100 +500,164 @@ def main():
         "test": {"epoch": [], "acc": [], "bac": []},
     }
 
-    prototypes = torch.load(args.prototype_ckpt, map_location="cpu").float()
-
     best_val_acc = -1.0
     prev_stats = None
+    proto = prototypes.to(device)
 
     for epoch in range(1, args.epochs + 1):
-        # Extract real features
-        train_feats, train_labels = extract_features(encoder, projector, train_loader, device)
-        val_feats, val_labels = extract_features(encoder, projector, val_loader, device)
-        test_feats, test_labels = extract_features(encoder, projector, test_loader, device)
+        train_proj_feats = project_feature_tensor(projector, train_backbone_feats, device, args.stage2_batch_size)
+        val_proj_feats = project_feature_tensor(projector, val_backbone_feats, device, args.stage2_batch_size)
+        test_proj_feats = project_feature_tensor(projector, test_backbone_feats, device, args.stage2_batch_size)
 
-        # Compute Gaussian stats
-        mu, sigma = compute_class_stats(train_feats, train_labels, num_classes)
-        shared_cov = compute_shared_covariance(train_feats, train_labels, mu)
-        mu = mu.to(device)
-        sigma = sigma.to(device)
-        shared_cov = shared_cov.to(device)
+        mu_real, sigma_real = compute_class_stats(train_proj_feats, train_labels, num_classes)
+        shared_cov_real = compute_shared_covariance(train_proj_feats, train_labels, mu_real)
+        mu = mu_real.to(device)
+        sigma = sigma_real.to(device)
+        shared_cov = shared_cov_real.to(device)
 
-        stats = summarize_gaussian_stats(mu, shared_cov)
-        delta_stats = gaussian_stats_delta(stats, prev_stats)
+        if epoch == 1:
+            per_class_acc = compute_prototype_per_class_acc(train_proj_feats, train_labels, proto, num_classes, device)
+        else:
+            per_class_acc = compute_classifier_per_class_acc(classifier, train_proj_feats, train_labels, num_classes, device)
 
-        proto = prototypes.to(device)
-        if proto.shape[1] != mu.shape[1]:
-            raise ValueError("prototype dimension mismatch with feature dim")
-        mu_tilde = args.lambda_mu * mu + (1.0 - args.lambda_mu) * proto
-
-        # AAS allocation
-        per_class_acc = compute_per_class_acc(classifier, train_feats, train_labels, num_classes, device)
+        hardest_indices = select_hardest_classes(per_class_acc, args.hardest_k, args.hardest_fraction)
         total_virtual = int(len(train_labels) * float(args.virtual_ratio))
-        alloc, weights = softmax_alloc(per_class_acc, args.aas_alpha, total_virtual)
+        alloc, weights = allocate_hardest_virtual_counts(per_class_acc, hardest_indices, args.aas_alpha, total_virtual)
 
-        # Sample virtual features (first pass from real-only stats)
-        virt_feats, virt_labels = sample_virtual_features(
+        mu_tilde_real = args.lambda_mu * mu + (1.0 - args.lambda_mu) * proto
+        seed_virtual_feats, seed_virtual_labels = sample_virtual_features(
+            mu_tilde_real,
+            shared_cov,
+            alloc,
+            delta=args.delta_noise,
+            cov_scale_factor=args.cov_scale_factor,
+        )
+        accepted_seed_feats, accepted_seed_labels, seed_total, seed_kept = filter_virtual_features(
+            seed_virtual_feats,
+            seed_virtual_labels,
+            classifier,
+            mu_tilde_real,
+            device,
+            args.virtual_conf_thresh,
+            args.virtual_center_cos_thresh,
+            args.stage2_batch_size,
+        )
+
+        if accepted_seed_feats.numel() > 0:
+            mix_feats = torch.cat([train_proj_feats, accepted_seed_feats], dim=0)
+            mix_labels = torch.cat([train_labels, accepted_seed_labels], dim=0)
+            mu_mix, sigma_mix = compute_class_stats(mix_feats, mix_labels, num_classes)
+            shared_cov_mix = compute_shared_covariance(mix_feats, mix_labels, mu_mix)
+            mu = mu_mix.to(device)
+            sigma = sigma_mix.to(device)
+            shared_cov = shared_cov_mix.to(device)
+        else:
+            mu = mu_real.to(device)
+            sigma = sigma_real.to(device)
+            shared_cov = shared_cov_real.to(device)
+
+        mu_tilde = args.lambda_mu * mu + (1.0 - args.lambda_mu) * proto
+        final_virtual_feats, final_virtual_labels = sample_virtual_features(
             mu_tilde,
             shared_cov,
             alloc,
             delta=args.delta_noise,
             cov_scale_factor=args.cov_scale_factor,
         )
+        accepted_virtual_feats, accepted_virtual_labels, final_total, final_kept = filter_virtual_features(
+            final_virtual_feats,
+            final_virtual_labels,
+            classifier,
+            mu_tilde,
+            device,
+            args.virtual_conf_thresh,
+            args.virtual_center_cos_thresh,
+            args.stage2_batch_size,
+        )
 
-        real_feats_dev = train_feats.to(device)
-        real_labels_dev = train_labels.to(device)
+        stats = summarize_gaussian_stats(mu, shared_cov)
+        delta_stats = gaussian_stats_delta(stats, prev_stats)
 
-        # Optional closed-loop recompute: recompute mu/cov from real + virtual,
-        # then resample virtual features from mixed stats.
-        if args.recompute_with_virtual and virt_feats.numel() > 0:
-            mix_feats = torch.cat([real_feats_dev, virt_feats], dim=0)
-            mix_labels = torch.cat([real_labels_dev, virt_labels], dim=0)
-
-            mu_mix, sigma_mix = compute_class_stats(mix_feats.detach().cpu(), mix_labels.detach().cpu(), num_classes)
-            shared_cov_mix = compute_shared_covariance(mix_feats.detach().cpu(), mix_labels.detach().cpu(), mu_mix)
-
-            mu = mu_mix.to(device)
-            sigma = sigma_mix.to(device)
-            shared_cov = shared_cov_mix.to(device)
-
-            stats = summarize_gaussian_stats(mu, shared_cov)
-            delta_stats = gaussian_stats_delta(stats, prev_stats)
-
-            mu_tilde = args.lambda_mu * mu + (1.0 - args.lambda_mu) * proto
-            virt_feats, virt_labels = sample_virtual_features(
-                mu_tilde,
-                shared_cov,
-                alloc,
-                delta=args.delta_noise,
-                cov_scale_factor=args.cov_scale_factor,
+        real_dataset = TensorDataset(train_backbone_feats, train_labels)
+        real_loader = DataLoader(
+            real_dataset,
+            batch_size=args.stage2_batch_size,
+            shuffle=True,
+            drop_last=False,
+        )
+        if accepted_virtual_feats.numel() > 0:
+            virtual_dataset = TensorDataset(accepted_virtual_feats, accepted_virtual_labels)
+            virtual_loader = DataLoader(
+                virtual_dataset,
+                batch_size=args.stage2_batch_size,
+                shuffle=True,
+                drop_last=False,
             )
-
-        if args.merge_real:
-            feats = torch.cat([real_feats_dev, virt_feats], dim=0)
-            labels = torch.cat([real_labels_dev, virt_labels], dim=0)
         else:
-            feats = virt_feats
-            labels = virt_labels
+            virtual_loader = None
 
-        # Train classifier on features
+        projector.train()
         classifier.train()
-        dataset = TensorDataset(feats, labels)
-        loader = DataLoader(dataset, batch_size=args.stage2_batch_size, shuffle=True, drop_last=False)
         loss_sum = 0.0
-        for x, y in loader:
+        real_cls_sum = 0.0
+        virtual_cls_sum = 0.0
+        anchor_sum = 0.0
+        step_count = 0
+        real_iter = iter(real_loader)
+        virtual_iter = iter(virtual_loader) if virtual_loader is not None else None
+        num_steps = max(1, max(len(real_loader), len(virtual_loader) if virtual_loader is not None else 0))
+
+        for _ in range(num_steps):
+            real_batch, real_iter = next_batch(real_loader, real_iter)
+            virt_batch, virtual_iter = next_batch(virtual_loader, virtual_iter)
+
+            real_x, real_y = real_batch
+            real_x = real_x.to(device)
+            real_y = real_y.to(device)
+
+            real_proj = projector(real_x)
+            real_anchor = projector_anchor(real_x).detach()
+            real_proj_for_cls = real_proj
             if args.train_noise_std > 0:
-                x = x + args.train_noise_std * torch.randn_like(x)
-            logits = classifier(x)
-            loss = nn.functional.cross_entropy(logits, y, weight=class_weights)
+                real_proj_for_cls = real_proj_for_cls + args.train_noise_std * torch.randn_like(real_proj_for_cls)
+            real_logits = classifier(real_proj_for_cls)
+            real_cls_loss = nn.functional.cross_entropy(real_logits, real_y, weight=class_weights)
+            anchor_loss = projector_anchor_loss(real_proj, real_anchor)
+
+            loss = real_cls_loss + args.anchor_weight * anchor_loss
+            virt_cls_loss = real_cls_loss.new_tensor(0.0)
+
+            if virt_batch is not None:
+                virt_x, virt_y = virt_batch
+                virt_x = virt_x.to(device)
+                virt_y = virt_y.to(device)
+                if args.train_noise_std > 0:
+                    virt_x = virt_x + args.train_noise_std * torch.randn_like(virt_x)
+                virt_logits = classifier(virt_x)
+                virt_cls_loss = nn.functional.cross_entropy(virt_logits, virt_y, weight=class_weights)
+                loss = loss + args.virtual_loss_weight * virt_cls_loss
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
             loss_sum += loss.item()
+            real_cls_sum += real_cls_loss.item()
+            virtual_cls_sum += virt_cls_loss.item()
+            anchor_sum += anchor_loss.item()
+            step_count += 1
 
-        val_metrics, val_per_class = evaluate_classifier(classifier, val_feats, val_labels, device, num_classes)
-        test_metrics, test_per_class = evaluate_classifier(classifier, test_feats, test_labels, device, num_classes)
+        val_proj_feats = project_feature_tensor(projector, val_backbone_feats, device, args.stage2_batch_size)
+        test_proj_feats = project_feature_tensor(projector, test_backbone_feats, device, args.stage2_batch_size)
+        val_metrics, val_per_class = evaluate_classifier(classifier, val_proj_feats, val_labels, device, num_classes)
+        test_metrics, test_per_class = evaluate_classifier(classifier, test_proj_feats, test_labels, device, num_classes)
 
-        train_loss = loss_sum / max(1, len(loader))
+        train_loss = loss_sum / max(1, step_count)
+        train_real_loss = real_cls_sum / max(1, step_count)
+        train_virtual_loss = virtual_cls_sum / max(1, step_count)
+        train_anchor_loss = anchor_sum / max(1, step_count)
+        hardest_names = [train_base.class_names[int(idx)] for idx in hardest_indices.tolist()]
+
         append_per_class_records(per_class_csv, epoch, "val", val_per_class, train_base.class_names)
         append_per_class_records(per_class_csv, epoch, "test", test_per_class, train_base.class_names)
         update_loss_history(curve_history, epoch, train_loss)
@@ -457,11 +670,18 @@ def main():
         log_line = (
             f"Epoch {epoch}/{args.epochs} "
             f"loss={train_loss:.6f} "
+            f"loss_real={train_real_loss:.6f} "
+            f"loss_virtual={train_virtual_loss:.6f} "
+            f"loss_anchor={train_anchor_loss:.6f} "
+            f"hardest_k={len(hardest_names)} "
+            f"seed_virtual={seed_kept}/{seed_total} "
+            f"final_virtual={final_kept}/{final_total} "
             f"cov_scale={args.cov_scale_factor:.4f} "
             f"cos_scale={args.cosine_scale:.4f} "
             f"val_acc={val_metrics[0]:.6f} val_bac={val_metrics[3]:.6f} val_bacc={val_metrics[4]:.6f} "
             f"test_acc={test_metrics[0]:.6f} test_bac={test_metrics[3]:.6f} test_bacc={test_metrics[4]:.6f}"
         )
+        hardest_line = "Hardest classes: " + ", ".join(hardest_names)
 
         gaussian_line = (
             "Gaussian stats: "
@@ -489,9 +709,12 @@ def main():
                 f"d_cov_eig_max={delta_stats['cov_eig_max']:+.6e} "
                 f"d_cov_cond={delta_stats['cov_cond']:+.6e}"
             )
+
         print(log_line)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(log_line + "\n")
+            print(hardest_line)
+            f.write(hardest_line + "\n")
             for line in format_tail_lines(val_per_class, train_base.class_names, tail_classes, "val"):
                 print(line)
                 f.write(line + "\n")
@@ -525,11 +748,13 @@ def main():
         if val_metrics[0] > best_val_acc:
             best_val_acc = val_metrics[0]
             torch.save(unwrap_model(classifier).state_dict(), os.path.join(ckpt_root, "classifier_best.pth"))
+            torch.save(unwrap_model(projector).state_dict(), os.path.join(ckpt_root, "projector_best.pth"))
             torch.save(mu.cpu(), os.path.join(ckpt_root, "gaussian_mu_best.pth"))
             torch.save(sigma.cpu(), os.path.join(ckpt_root, "gaussian_sigma_best.pth"))
             torch.save(shared_cov.cpu(), os.path.join(ckpt_root, "shared_cov_best.pth"))
 
         torch.save(unwrap_model(classifier).state_dict(), os.path.join(ckpt_root, "classifier_latest.pth"))
+        torch.save(unwrap_model(projector).state_dict(), os.path.join(ckpt_root, "projector_latest.pth"))
         torch.save(mu.cpu(), os.path.join(ckpt_root, "gaussian_mu_latest.pth"))
         torch.save(sigma.cpu(), os.path.join(ckpt_root, "gaussian_sigma_latest.pth"))
         torch.save(shared_cov.cpu(), os.path.join(ckpt_root, "shared_cov_latest.pth"))

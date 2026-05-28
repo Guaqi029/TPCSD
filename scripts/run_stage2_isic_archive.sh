@@ -21,7 +21,13 @@ BATCH_SIZE="${BATCH_SIZE:-256}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 EPOCHS="${EPOCHS:-100}"
 TRAIN_NOISE_STD="${TRAIN_NOISE_STD:-0.01}"
-RECOMPUTE_WITH_VIRTUAL="${RECOMPUTE_WITH_VIRTUAL:-1}"
+PROJECTOR_LR="${PROJECTOR_LR:-1e-4}"
+ANCHOR_WEIGHT="${ANCHOR_WEIGHT:-0.05}"
+VIRTUAL_LOSS_WEIGHT="${VIRTUAL_LOSS_WEIGHT:-1.0}"
+HARDEST_K="${HARDEST_K:-3}"
+HARDEST_FRACTION="${HARDEST_FRACTION:-0.5}"
+VIRTUAL_CONF_THRESH="${VIRTUAL_CONF_THRESH:-0.6}"
+VIRTUAL_CENTER_COS_THRESH="${VIRTUAL_CENTER_COS_THRESH:-0.2}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
 STAGE1_RUN_DIR="${STAGE1_RUN_DIR:-}"
 CKPT_TAG="${CKPT_TAG:-best}"
@@ -50,12 +56,6 @@ PROJECTOR_CKPT="${STAGE1_RUN_DIR}/projector_${CKPT_TAG}.pth"
 [[ -f "${PROTOTYPE_CKPT}" ]] || { echo "Missing prototype_ckpt: ${PROTOTYPE_CKPT}" >&2; exit 1; }
 
 TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
-if [[ "${RECOMPUTE_WITH_VIRTUAL}" == "1" || "${RECOMPUTE_WITH_VIRTUAL}" == "true" || "${RECOMPUTE_WITH_VIRTUAL}" == "True" ]]; then
-  set -- --recompute_with_virtual
-else
-  set --
-fi
-
 RUN_NAME="run_tpcsd_stage2_isic_archive_${TIMESTAMP}"
 
 python train_stage2.py \
@@ -86,6 +86,12 @@ python train_stage2.py \
   --cov_scale_factor 1.0 \
   --cosine_scale 16.0 \
   --lr 1e-3 \
+  --projector_lr "${PROJECTOR_LR}" \
   --delta_noise 0.01 \
   --train_noise_std "${TRAIN_NOISE_STD}" \
-  "$@"
+  --hardest_k "${HARDEST_K}" \
+  --hardest_fraction "${HARDEST_FRACTION}" \
+  --virtual_conf_thresh "${VIRTUAL_CONF_THRESH}" \
+  --virtual_center_cos_thresh "${VIRTUAL_CENTER_COS_THRESH}" \
+  --anchor_weight "${ANCHOR_WEIGHT}" \
+  --virtual_loss_weight "${VIRTUAL_LOSS_WEIGHT}"

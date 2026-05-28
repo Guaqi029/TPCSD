@@ -37,7 +37,9 @@ fi
 [[ -n "${STAGE2_RUN_DIR}" ]] || { echo "Could not resolve latest Stage2 run dir." >&2; exit 1; }
 
 PROJECTOR_CKPT=""
-if [[ -f "${STAGE1_RUN_DIR}/projector_${STAGE1_CKPT_TAG}.pth" ]]; then
+if [[ -f "${STAGE2_RUN_DIR}/projector_${STAGE2_CKPT_TAG}.pth" ]]; then
+  PROJECTOR_CKPT="${STAGE2_RUN_DIR}/projector_${STAGE2_CKPT_TAG}.pth"
+elif [[ -f "${STAGE1_RUN_DIR}/projector_${STAGE1_CKPT_TAG}.pth" ]]; then
   PROJECTOR_CKPT="${STAGE1_RUN_DIR}/projector_${STAGE1_CKPT_TAG}.pth"
 fi
 

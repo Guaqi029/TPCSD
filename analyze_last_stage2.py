@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from data.dataset import ISICDataset
 from data.transforms import Transforms
-from models import CosineClassifier, ResNetBackbone
+from models import CosineClassifier, Projector, ResNetBackbone
 from utils.checkpoint_utils import load_state_dict_flexible
 from utils.csv_utils import label_frame_to_int
 from utils.metrics import (
@@ -53,14 +53,18 @@ def build_class_counts(csv_file):
     return labels.sum(axis=0).to_numpy(dtype=np.int64), list(frame.columns[1:])
 
 
-def extract_features(encoder, loader, device):
+def extract_features(encoder, projector, loader, device):
     encoder.eval()
+    if projector is not None:
+        projector.eval()
     feats = []
     labels = []
     with torch.no_grad():
         for image, label in loader:
             image = image.to(device)
             feat = encoder(image)
+            if projector is not None:
+                feat = projector(feat)
             feats.append(feat.detach().cpu())
             labels.append(label.detach().cpu())
     return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
@@ -104,37 +108,15 @@ def compute_per_class_acc(classifier, feats, labels, num_classes, device):
     return acc
 
 
-def select_hardest_classes(per_class_acc, hardest_k, hardest_fraction):
-    num_classes = int(per_class_acc.shape[0])
-    if hardest_k > 0:
-        k = min(num_classes, int(hardest_k))
-    else:
-        hardest_fraction = float(hardest_fraction)
-        k = int(np.ceil(num_classes * hardest_fraction))
-        k = max(1, min(num_classes, k))
-    order = torch.argsort(per_class_acc, descending=False)
-    return order[:k]
-
-
-def allocate_hardest_virtual_counts(per_class_acc, hardest_indices, alpha, total):
-    counts = torch.zeros_like(per_class_acc, dtype=torch.long)
-    weights = torch.zeros_like(per_class_acc, dtype=torch.float32)
-    total = int(total)
-    if total <= 0 or hardest_indices.numel() == 0:
-        return counts, weights
-
-    hardest_acc = per_class_acc[hardest_indices]
-    scores = torch.exp(float(alpha) * (1.0 - hardest_acc))
-    hardest_weights = scores / scores.sum()
-    hardest_counts = torch.floor(hardest_weights * float(total)).to(torch.long)
-    diff = int(total - hardest_counts.sum().item())
+def softmax_alloc(acc, alpha, total):
+    scores = torch.exp(alpha * (1.0 - acc))
+    weights = scores / scores.sum()
+    counts = torch.floor(weights * float(total)).to(torch.long)
+    diff = int(total - counts.sum().item())
     if diff > 0:
-        order = torch.argsort(hardest_weights, descending=True)
+        order = torch.argsort(weights, descending=True)
         for i in range(diff):
-            hardest_counts[order[i % len(order)]] += 1
-
-    counts[hardest_indices] = hardest_counts
-    weights[hardest_indices] = hardest_weights
+            counts[order[i % len(order)]] += 1
     return counts, weights
 
 
@@ -217,6 +199,20 @@ def evaluate_classifier(classifier, feats, labels, device, num_classes):
     return avg_metrics, per_class_metrics
 
 
+def infer_projector_dims(projector_ckpt, feat_dim, default_proj_dim, default_hidden_dim):
+    if not projector_ckpt or not os.path.isfile(projector_ckpt):
+        return False, feat_dim, 0
+    state = torch.load(projector_ckpt, map_location="cpu")
+    keys = list(state.keys())
+    if "net.weight" in state:
+        return True, int(state["net.weight"].shape[0]), 0
+    if "net.0.weight" in state and "net.2.weight" in state:
+        hidden_dim = int(state["net.0.weight"].shape[0])
+        proj_dim = int(state["net.2.weight"].shape[0])
+        return True, proj_dim, hidden_dim
+    return True, default_proj_dim, default_hidden_dim
+
+
 def infer_classifier_head(classifier_ckpt, feature_dim, num_classes, default_cosine_scale):
     state = torch.load(classifier_ckpt, map_location="cpu")
     if isinstance(state, dict):
@@ -248,6 +244,7 @@ def main():
     parser.add_argument("--encoder_ckpt", required=True)
     parser.add_argument("--classifier_ckpt", required=True)
     parser.add_argument("--backbone", default="resnet50")
+    parser.add_argument("--projector_ckpt", default="")
     parser.add_argument("--prototype_ckpt", default="")
     parser.add_argument("--gaussian_mu_ckpt", default="")
     parser.add_argument("--gaussian_sigma_ckpt", default="")
@@ -257,10 +254,10 @@ def main():
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--proj_dim", type=int, default=128)
+    parser.add_argument("--proj_hidden_dim", type=int, default=0)
     parser.add_argument("--aas_alpha", type=float, default=2.0)
     parser.add_argument("--virtual_ratio", type=float, default=1.0)
-    parser.add_argument("--hardest_k", type=int, default=3)
-    parser.add_argument("--hardest_fraction", type=float, default=0.5)
     parser.add_argument("--lambda_mu", type=float, default=0.5)
     parser.add_argument("--gamma_proto", type=float, default=0.2)
     parser.add_argument("--delta_noise", type=float, default=0.01)
@@ -306,7 +303,16 @@ def main():
 
     encoder = ResNetBackbone(args.backbone, pretrained=False).to(device)
     load_state_dict_flexible(encoder, args.encoder_ckpt)
+
+    use_projector, inferred_proj_dim, inferred_hidden_dim = infer_projector_dims(
+        args.projector_ckpt, encoder.feat_dim, args.proj_dim, args.proj_hidden_dim
+    )
+    projector = None
     feature_dim = encoder.feat_dim
+    if use_projector:
+        projector = Projector(encoder.feat_dim, proj_dim=inferred_proj_dim, hidden_dim=inferred_hidden_dim).to(device)
+        load_state_dict_flexible(projector, args.projector_ckpt)
+        feature_dim = inferred_proj_dim
 
     classifier, classifier_type = infer_classifier_head(
         args.classifier_ckpt, feature_dim, len(class_names), args.cosine_scale
@@ -314,9 +320,9 @@ def main():
     classifier = classifier.to(device)
     load_state_dict_flexible(classifier, args.classifier_ckpt)
 
-    train_feats, train_labels = extract_features(encoder, train_loader, device)
-    val_feats, val_labels = extract_features(encoder, val_loader, device)
-    test_feats, test_labels = extract_features(encoder, test_loader, device)
+    train_feats, train_labels = extract_features(encoder, projector, train_loader, device)
+    val_feats, val_labels = extract_features(encoder, projector, val_loader, device)
+    test_feats, test_labels = extract_features(encoder, projector, test_loader, device)
 
     if args.gaussian_mu_ckpt and os.path.isfile(args.gaussian_mu_ckpt):
         mu = torch.load(args.gaussian_mu_ckpt, map_location="cpu").float()
@@ -335,11 +341,6 @@ def main():
         prototypes = torch.load(args.prototype_ckpt, map_location="cpu").float()
     else:
         prototypes = torch.zeros(len(class_names), feature_dim, dtype=torch.float32)
-    if prototypes.shape[1] != feature_dim:
-        raise ValueError(
-            "prototype dimension mismatch with encoder output dimension. "
-            "Offline Stage2 analysis now expects projector-free Stage1 checkpoints."
-        )
 
     mu = mu.to(device)
     sigma = sigma.to(device)
@@ -364,8 +365,7 @@ def main():
     test_metrics, test_per_class = evaluate_classifier(classifier, test_feats, test_labels, device, len(class_names))
     train_acc = compute_per_class_acc(classifier, train_feats, train_labels, len(class_names), device)
     virtual_total = int(len(train_labels) * float(args.virtual_ratio))
-    hardest_indices = select_hardest_classes(train_acc, args.hardest_k, args.hardest_fraction)
-    alloc, alloc_weights = allocate_hardest_virtual_counts(train_acc, hardest_indices, args.aas_alpha, virtual_total)
+    alloc, alloc_weights = softmax_alloc(train_acc, args.aas_alpha, virtual_total)
     if args.shared_cov_ckpt and os.path.isfile(args.shared_cov_ckpt):
         virt_feats, virt_labels = sample_virtual_features_shared_cov(
             mu_tilde,
@@ -479,6 +479,7 @@ def main():
         "dataset": args.dataset,
         "encoder_ckpt": args.encoder_ckpt,
         "classifier_ckpt": args.classifier_ckpt,
+        "projector_ckpt": args.projector_ckpt,
         "prototype_ckpt": args.prototype_ckpt,
         "gaussian_mu_ckpt": args.gaussian_mu_ckpt,
         "gaussian_sigma_ckpt": args.gaussian_sigma_ckpt,

@@ -3,6 +3,9 @@ defaults:
   image_size: 224
   backbone: resnet50
   pretrained: true
+  use_projector: true
+  proj_dim: 128
+  proj_hidden_dim: 0
   epochs: 200
   batch_size: 128
   num_workers: 8

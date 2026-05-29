@@ -58,6 +58,8 @@ python train_stage1.py \
   --seed "${SEED}" \
   --backbone medclip_vit \
   "${PRETRAIN_FLAG}" \
+  --use_projector \
+  --proj_dim 128 \
   --cls_loss ce \
   --pcd_weight 1.0 \
   --pcd_temp 0.05 \

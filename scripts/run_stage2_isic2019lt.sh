@@ -22,6 +22,8 @@ STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-2048}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 EPOCHS="${EPOCHS:-100}"
 TRAIN_NOISE_STD="${TRAIN_NOISE_STD:-0.01}"
+PROJECTOR_LR="${PROJECTOR_LR:-1e-4}"
+ANCHOR_WEIGHT="${ANCHOR_WEIGHT:-0.05}"
 VIRTUAL_LOSS_WEIGHT="${VIRTUAL_LOSS_WEIGHT:-1.0}"
 HARDEST_K="${HARDEST_K:-3}"
 HARDEST_FRACTION="${HARDEST_FRACTION:-0.5}"
@@ -47,8 +49,10 @@ fi
 
 ENCODER_CKPT="${STAGE1_RUN_DIR}/resnet_encoder_${CKPT_TAG}.pth"
 PROTOTYPE_CKPT="${STAGE1_RUN_DIR}/prototype_memory_${CKPT_TAG}.pth"
+PROJECTOR_CKPT="${STAGE1_RUN_DIR}/projector_${CKPT_TAG}.pth"
 
 [[ -f "${ENCODER_CKPT}" ]] || { echo "Missing encoder_ckpt: ${ENCODER_CKPT}" >&2; exit 1; }
+[[ -f "${PROJECTOR_CKPT}" ]] || { echo "Missing projector_ckpt: ${PROJECTOR_CKPT}" >&2; exit 1; }
 [[ -f "${PROTOTYPE_CKPT}" ]] || { echo "Missing prototype_ckpt: ${PROTOTYPE_CKPT}" >&2; exit 1; }
 
 TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
@@ -70,7 +74,10 @@ python train_stage2.py \
   --image_size 224 \
   --seed "${SEED}" \
   --backbone medclip_vit \
+  --use_projector \
+  --proj_dim 128 \
   --encoder_ckpt "${ENCODER_CKPT}" \
+  --projector_ckpt "${PROJECTOR_CKPT}" \
   --prototype_ckpt "${PROTOTYPE_CKPT}" \
   --merge_real \
   --virtual_ratio 1.0 \
@@ -79,10 +86,12 @@ python train_stage2.py \
   --cov_scale_factor 1.0 \
   --cosine_scale 16.0 \
   --lr 1e-3 \
+  --projector_lr "${PROJECTOR_LR}" \
   --delta_noise 0.01 \
   --train_noise_std "${TRAIN_NOISE_STD}" \
   --hardest_k "${HARDEST_K}" \
   --hardest_fraction "${HARDEST_FRACTION}" \
   --virtual_conf_thresh "${VIRTUAL_CONF_THRESH}" \
   --virtual_center_cos_thresh "${VIRTUAL_CENTER_COS_THRESH}" \
+  --anchor_weight "${ANCHOR_WEIGHT}" \
   --virtual_loss_weight "${VIRTUAL_LOSS_WEIGHT}"

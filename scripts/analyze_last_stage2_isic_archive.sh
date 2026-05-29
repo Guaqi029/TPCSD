@@ -36,6 +36,13 @@ fi
 [[ -n "${STAGE1_RUN_DIR}" ]] || { echo "Could not resolve latest Stage1 run dir." >&2; exit 1; }
 [[ -n "${STAGE2_RUN_DIR}" ]] || { echo "Could not resolve latest Stage2 run dir." >&2; exit 1; }
 
+PROJECTOR_CKPT=""
+if [[ -f "${STAGE2_RUN_DIR}/projector_${STAGE2_CKPT_TAG}.pth" ]]; then
+  PROJECTOR_CKPT="${STAGE2_RUN_DIR}/projector_${STAGE2_CKPT_TAG}.pth"
+elif [[ -f "${STAGE1_RUN_DIR}/projector_${STAGE1_CKPT_TAG}.pth" ]]; then
+  PROJECTOR_CKPT="${STAGE1_RUN_DIR}/projector_${STAGE1_CKPT_TAG}.pth"
+fi
+
 python analyze_last_stage2.py \
   --dataset ISIC_Archive \
   --data_path "${DATA_ROOT}" \
@@ -43,6 +50,7 @@ python analyze_last_stage2.py \
   --csv_file_val "${VAL_CSV}" \
   --csv_file_test "${TEST_CSV}" \
   --encoder_ckpt "${STAGE1_RUN_DIR}/resnet_encoder_${STAGE1_CKPT_TAG}.pth" \
+  --projector_ckpt "${PROJECTOR_CKPT}" \
   --prototype_ckpt "${STAGE1_RUN_DIR}/prototype_memory_${STAGE1_CKPT_TAG}.pth" \
   --classifier_ckpt "${STAGE2_RUN_DIR}/classifier_${STAGE2_CKPT_TAG}.pth" \
   --gaussian_mu_ckpt "${STAGE2_RUN_DIR}/gaussian_mu_${STAGE2_CKPT_TAG}.pth" \

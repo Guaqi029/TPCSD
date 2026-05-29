@@ -40,14 +40,15 @@ from utils.metrics import (
 
 from models import ResNetBackbone, Projector
 from utils.losses import (
+    active_prototype_mask,
     balanced_softmax_loss,
-    compute_batch_class_means,
+    compute_batch_multi_prototype_means,
     deferred_balanced_softmax_loss,
     ema_update_prototypes,
+    ensure_3d_prototypes,
     enqueue_feature_queue,
     pcd_loss,
     prototype_nearest_neighbor_separation_loss,
-    prototype_uniformity_loss,
     recalibrate_prototypes,
     sp_kd_loss,
 )
@@ -130,9 +131,12 @@ def evaluate(encoder, classifier, loader, device, num_classes):
 
 
 def summarize_active_prototypes(prototypes, active_mask=None):
+    prototypes = ensure_3d_prototypes(prototypes)
     if active_mask is not None:
         active_mask = active_mask.to(device=prototypes.device, dtype=torch.bool)
         prototypes = prototypes[active_mask]
+    else:
+        prototypes = prototypes.reshape(-1, prototypes.shape[-1])
     if prototypes.numel() == 0 or prototypes.shape[0] < 2:
         return float("nan"), float("nan")
 
@@ -158,6 +162,12 @@ def linear_warmup_weight(epoch, target_weight, warmup_start_epoch, warmup_end_ep
     return target_weight
 
 
+def serialize_prototypes_for_checkpoint(prototypes):
+    if prototypes.dim() == 3 and prototypes.shape[1] == 1:
+        return prototypes[:, 0].detach().cpu()
+    return prototypes.detach().cpu()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="ISIC2019LT")
@@ -179,6 +189,7 @@ def main():
     parser.add_argument("--use_projector", action="store_true")
     parser.add_argument("--proj_dim", type=int, default=128)
     parser.add_argument("--proj_hidden_dim", type=int, default=0)
+    parser.add_argument("--num_prototypes_per_class", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--momentum", type=float, default=0.9)
@@ -241,6 +252,8 @@ def main():
         raise ValueError("Balanced Softmax variants should not be combined with class-weighted CE.")
     if args.punif_warmup_end_epoch < args.punif_warmup_start_epoch:
         raise ValueError("punif_warmup_end_epoch must be greater than or equal to punif_warmup_start_epoch")
+    if args.num_prototypes_per_class < 1:
+        raise ValueError("num_prototypes_per_class must be >= 1")
 
     _, _, tail_classes = split_groups(counts)
     group_specs = build_group_specs(class_names, counts)
@@ -301,11 +314,12 @@ def main():
         "test": {"epoch": [], "acc": [], "bac": []},
     }
 
-    prototypes = torch.zeros(num_classes, proj_dim, device=device)
+    num_proto = int(args.num_prototypes_per_class)
+    prototypes = torch.zeros(num_classes, num_proto, proj_dim, device=device)
     student_queue = torch.zeros(args.queue_size, proj_dim, device=device)
     teacher_queue = torch.zeros(args.queue_size, proj_dim, device=device)
     label_queue = torch.full((args.queue_size,), -1, dtype=torch.long, device=device)
-    prototype_seen = torch.zeros(num_classes, dtype=torch.bool, device=device)
+    prototype_seen = torch.zeros(num_classes, num_proto, dtype=torch.bool, device=device)
 
     best_val_acc = -1.0
     for epoch in range(1, args.epochs + 1):
@@ -359,18 +373,23 @@ def main():
                 alpha = torch.sqrt(torch.clamp(nmax / torch.clamp(counts_tensor, min=1.0), min=1.0))
                 sample_weights = alpha[label]
 
-            batch_class_mean, valid_mask = compute_batch_class_means(z_s, label, num_classes)
+            batch_class_mean, valid_mask = compute_batch_multi_prototype_means(
+                z_s,
+                label,
+                prototypes.detach(),
+                prototype_seen=prototype_seen,
+            )
             active_proto_mask = prototype_seen | valid_mask
             # Use detached memory as global context, but keep gradients on classes present in this batch.
             proto_proxy = torch.where(
-                valid_mask.unsqueeze(1),
+                valid_mask.unsqueeze(-1),
                 batch_class_mean,
                 prototypes.detach(),
             )
             punif_raw = prototype_nearest_neighbor_separation_loss(
-                proto_proxy,
+                proto_proxy.reshape(-1, proto_proxy.shape[-1]),
                 margin=args.proto_sep_margin,
-                active_mask=active_proto_mask,
+                active_mask=active_proto_mask.reshape(-1),
             )
             punif = current_punif_weight * punif_raw
 
@@ -434,9 +453,9 @@ def main():
         train_punif_loss = punif_loss_sum / max(1, len(train_loader))
         proto_mean_cos, proto_max_cos = summarize_active_prototypes(prototypes.detach(), prototype_seen)
         proto_uniformity_eval = prototype_nearest_neighbor_separation_loss(
-            prototypes.detach(),
+            prototypes.detach().reshape(-1, prototypes.shape[-1]),
             margin=args.proto_sep_margin,
-            active_mask=prototype_seen,
+            active_mask=prototype_seen.reshape(-1),
         ).item()
         val_metrics, val_per_class = evaluate(encoder, classifier, val_loader, device, num_classes)
         test_metrics, test_per_class = evaluate(encoder, classifier, test_loader, device, num_classes)
@@ -482,7 +501,7 @@ def main():
             torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_best.pth"))
             if projector is not None:
                 torch.save(projector.state_dict(), os.path.join(ckpt_root, "projector_best.pth"))
-            torch.save(prototypes, os.path.join(ckpt_root, "prototype_memory_best.pth"))
+            torch.save(serialize_prototypes_for_checkpoint(prototypes), os.path.join(ckpt_root, "prototype_memory_best.pth"))
 
         if args.cls_loss == "deferred_balanced_softmax":
             if args.cls_warmup_epochs > 1 and epoch == args.cls_warmup_epochs - 1:
@@ -490,19 +509,19 @@ def main():
                 torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_pre_switch.pth"))
                 if projector is not None:
                     torch.save(projector.state_dict(), os.path.join(ckpt_root, "projector_pre_switch.pth"))
-                torch.save(prototypes, os.path.join(ckpt_root, "prototype_memory_pre_switch.pth"))
+                torch.save(serialize_prototypes_for_checkpoint(prototypes), os.path.join(ckpt_root, "prototype_memory_pre_switch.pth"))
             if epoch == args.cls_warmup_epochs:
                 torch.save(encoder.state_dict(), os.path.join(ckpt_root, "resnet_encoder_switch_epoch.pth"))
                 torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_switch_epoch.pth"))
                 if projector is not None:
                     torch.save(projector.state_dict(), os.path.join(ckpt_root, "projector_switch_epoch.pth"))
-                torch.save(prototypes, os.path.join(ckpt_root, "prototype_memory_switch_epoch.pth"))
+                torch.save(serialize_prototypes_for_checkpoint(prototypes), os.path.join(ckpt_root, "prototype_memory_switch_epoch.pth"))
 
         torch.save(encoder.state_dict(), os.path.join(ckpt_root, "resnet_encoder_latest.pth"))
         torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_latest.pth"))
         if projector is not None:
             torch.save(projector.state_dict(), os.path.join(ckpt_root, "projector_latest.pth"))
-        torch.save(prototypes, os.path.join(ckpt_root, "prototype_memory_latest.pth"))
+        torch.save(serialize_prototypes_for_checkpoint(prototypes), os.path.join(ckpt_root, "prototype_memory_latest.pth"))
 
 
 if __name__ == "__main__":

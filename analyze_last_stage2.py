@@ -15,6 +15,7 @@ from data.transforms import Transforms
 from models import CosineClassifier, Projector, ResNetBackbone
 from utils.checkpoint_utils import load_state_dict_flexible
 from utils.csv_utils import label_frame_to_int
+from utils.losses import active_prototype_mask, ensure_3d_prototypes, reduce_prototypes_mean
 from utils.metrics import (
     build_group_specs,
     compute_avg_metrics,
@@ -108,6 +109,21 @@ def compute_per_class_acc(classifier, feats, labels, num_classes, device):
     return acc
 
 
+def compute_prototype_per_class_acc(feats, labels, prototypes, num_classes, device):
+    with torch.no_grad():
+        x = F.normalize(feats.to(device), p=2, dim=1)
+        proto = F.normalize(ensure_3d_prototypes(prototypes).to(device), p=2, dim=2)
+        scores = torch.einsum("bd,ckd->bck", x, proto).max(dim=2).values
+        pred = scores.argmax(dim=1).cpu()
+    acc = torch.zeros(num_classes, dtype=torch.float32)
+    for class_id in range(num_classes):
+        idx = labels == class_id
+        if idx.sum() == 0:
+            continue
+        acc[class_id] = (pred[idx] == class_id).float().mean()
+    return acc
+
+
 def softmax_alloc(acc, alpha, total):
     scores = torch.exp(alpha * (1.0 - acc))
     weights = scores / scores.sum()
@@ -120,41 +136,69 @@ def softmax_alloc(acc, alpha, total):
     return counts, weights
 
 
-def sample_virtual_features_shared_cov(mu_tilde, shared_cov, counts, delta=0.01, cov_scale_factor=1.0):
+def sample_virtual_features_shared_cov(mu_tilde, shared_cov, counts, delta=0.01, cov_scale_factor=1.0, active_mask=None):
     feats = []
     labels = []
+    centers = ensure_3d_prototypes(mu_tilde)
+    if active_mask is None:
+        active_mask = active_prototype_mask(centers)
     base_cov = shared_cov * float(cov_scale_factor)
     base_cov = base_cov + torch.eye(shared_cov.shape[0], device=shared_cov.device, dtype=shared_cov.dtype) * (float(delta) ** 2)
-    for class_id in range(mu_tilde.shape[0]):
+    for class_id in range(centers.shape[0]):
         k = int(counts[class_id].item())
         if k <= 0:
             continue
-        mvn = torch.distributions.MultivariateNormal(loc=mu_tilde[class_id], covariance_matrix=base_cov)
-        z = mvn.sample((k,))
-        feats.append(z)
-        labels.append(torch.full((k,), class_id, dtype=torch.long, device=mu_tilde.device))
+        class_active = torch.flatnonzero(active_mask[class_id], as_tuple=False).flatten()
+        if class_active.numel() == 0:
+            class_active = torch.arange(centers.shape[1], device=centers.device)
+        per_proto = torch.full((class_active.numel(),), k // max(1, class_active.numel()), device=centers.device, dtype=torch.long)
+        remainder = int(k - per_proto.sum().item())
+        for idx in range(remainder):
+            per_proto[idx % class_active.numel()] += 1
+        for idx, slot in enumerate(class_active.tolist()):
+            slot_count = int(per_proto[idx].item())
+            if slot_count <= 0:
+                continue
+            mvn = torch.distributions.MultivariateNormal(loc=centers[class_id, slot], covariance_matrix=base_cov)
+            z = mvn.sample((slot_count,))
+            feats.append(z)
+            labels.append(torch.full((slot_count,), class_id, dtype=torch.long, device=centers.device))
     if not feats:
-        return torch.empty(0, mu_tilde.shape[1], device=mu_tilde.device), torch.empty(0, dtype=torch.long, device=mu_tilde.device)
+        return torch.empty(0, centers.shape[-1], device=centers.device), torch.empty(0, dtype=torch.long, device=centers.device)
     return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
 
 
 def sample_virtual_features_diag(mu_tilde, sigma, prototypes, counts, gamma=0.2, delta=0.01):
     feats = []
     labels = []
-    for class_id in range(mu_tilde.shape[0]):
+    centers = ensure_3d_prototypes(mu_tilde)
+    proto_3d = ensure_3d_prototypes(prototypes)
+    active_mask = active_prototype_mask(proto_3d)
+    for class_id in range(centers.shape[0]):
         k = int(counts[class_id].item())
         if k <= 0:
             continue
-        eps = torch.randn(k, mu_tilde.shape[1], device=mu_tilde.device)
-        noise = torch.randn(k, mu_tilde.shape[1], device=mu_tilde.device)
-        mu_c = mu_tilde[class_id].unsqueeze(0)
-        sigma_c = sigma[class_id].unsqueeze(0)
-        proto_c = prototypes[class_id].unsqueeze(0)
-        z = mu_c + eps * sigma_c + gamma * (proto_c - mu_c) + delta * noise
-        feats.append(z)
-        labels.append(torch.full((k,), class_id, dtype=torch.long, device=mu_tilde.device))
+        class_active = torch.flatnonzero(active_mask[class_id], as_tuple=False).flatten()
+        if class_active.numel() == 0:
+            class_active = torch.arange(centers.shape[1], device=centers.device)
+        per_proto = torch.full((class_active.numel(),), k // max(1, class_active.numel()), device=centers.device, dtype=torch.long)
+        remainder = int(k - per_proto.sum().item())
+        for idx in range(remainder):
+            per_proto[idx % class_active.numel()] += 1
+        for idx, slot in enumerate(class_active.tolist()):
+            slot_count = int(per_proto[idx].item())
+            if slot_count <= 0:
+                continue
+            eps = torch.randn(slot_count, centers.shape[-1], device=centers.device)
+            noise = torch.randn(slot_count, centers.shape[-1], device=centers.device)
+            mu_c = centers[class_id, slot].unsqueeze(0)
+            sigma_c = sigma[class_id].unsqueeze(0)
+            proto_c = proto_3d[class_id, slot].unsqueeze(0)
+            z = mu_c + eps * sigma_c + gamma * (proto_c - mu_c) + delta * noise
+            feats.append(z)
+            labels.append(torch.full((slot_count,), class_id, dtype=torch.long, device=centers.device))
     if not feats:
-        return torch.empty(0, mu_tilde.shape[1], device=mu_tilde.device), torch.empty(0, dtype=torch.long, device=mu_tilde.device)
+        return torch.empty(0, centers.shape[-1], device=centers.device), torch.empty(0, dtype=torch.long, device=centers.device)
     return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
 
 
@@ -258,6 +302,8 @@ def main():
     parser.add_argument("--proj_hidden_dim", type=int, default=0)
     parser.add_argument("--aas_alpha", type=float, default=2.0)
     parser.add_argument("--virtual_ratio", type=float, default=1.0)
+    parser.add_argument("--hardest_k", type=int, default=3)
+    parser.add_argument("--hardest_fraction", type=float, default=0.5)
     parser.add_argument("--lambda_mu", type=float, default=0.5)
     parser.add_argument("--gamma_proto", type=float, default=0.2)
     parser.add_argument("--delta_noise", type=float, default=0.01)
@@ -338,9 +384,11 @@ def main():
         _, sigma = compute_class_stats(train_feats, train_labels, len(class_names))
 
     if args.prototype_ckpt and os.path.isfile(args.prototype_ckpt):
-        prototypes = torch.load(args.prototype_ckpt, map_location="cpu").float()
+        prototypes = ensure_3d_prototypes(torch.load(args.prototype_ckpt, map_location="cpu").float())
     else:
-        prototypes = torch.zeros(len(class_names), feature_dim, dtype=torch.float32)
+        prototypes = torch.zeros(len(class_names), 1, feature_dim, dtype=torch.float32)
+    proto_active_mask = active_prototype_mask(prototypes)
+    prototype_mean = reduce_prototypes_mean(prototypes, proto_active_mask)
 
     mu = mu.to(device)
     sigma = sigma.to(device)
@@ -359,13 +407,16 @@ def main():
         f"cov_cond={stats['cov_cond']:.6e}"
     )
     prototypes = prototypes.to(device)
-    mu_tilde = args.lambda_mu * mu + (1.0 - args.lambda_mu) * prototypes
+    proto_active_mask = proto_active_mask.to(device)
+    mu_tilde = args.lambda_mu * mu.unsqueeze(1) + (1.0 - args.lambda_mu) * prototypes
+    class_centers = reduce_prototypes_mean(mu_tilde, proto_active_mask)
 
     val_metrics, val_per_class = evaluate_classifier(classifier, val_feats, val_labels, device, len(class_names))
     test_metrics, test_per_class = evaluate_classifier(classifier, test_feats, test_labels, device, len(class_names))
-    train_acc = compute_per_class_acc(classifier, train_feats, train_labels, len(class_names), device)
+    train_acc = compute_prototype_per_class_acc(train_feats, train_labels, prototypes, len(class_names), device)
     virtual_total = int(len(train_labels) * float(args.virtual_ratio))
-    alloc, alloc_weights = softmax_alloc(train_acc, args.aas_alpha, virtual_total)
+    hardest_indices = select_hardest_classes(train_acc, args.hardest_k, args.hardest_fraction)
+    alloc, alloc_weights = allocate_hardest_virtual_counts(train_acc, hardest_indices, args.aas_alpha, virtual_total)
     if args.shared_cov_ckpt and os.path.isfile(args.shared_cov_ckpt):
         virt_feats, virt_labels = sample_virtual_features_shared_cov(
             mu_tilde,
@@ -373,6 +424,7 @@ def main():
             alloc,
             delta=args.delta_noise,
             cov_scale_factor=args.cov_scale_factor,
+            active_mask=proto_active_mask,
         )
     else:
         virt_feats, virt_labels = sample_virtual_features_diag(
@@ -386,10 +438,13 @@ def main():
         real_class_feats = train_feats[real_idx]
         virt_class_feats = virt_feats.detach().cpu()[virt_idx] if virt_idx.numel() > 0 else torch.empty(0, feature_dim)
 
-        proto = F.normalize(prototypes[class_id].detach().cpu().unsqueeze(0), dim=1)
+        class_proto = prototypes[class_id].detach().cpu()
+        class_proto_active = proto_active_mask[class_id].detach().cpu()
+        active_proto = class_proto[class_proto_active] if torch.any(class_proto_active) else class_proto[:1]
+        proto = F.normalize(active_proto, dim=1)
         if virt_class_feats.shape[0] > 0:
             virt_norm = F.normalize(virt_class_feats, dim=1)
-            proto_cos = torch.matmul(virt_norm, proto.t()).squeeze(1)
+            proto_cos = torch.matmul(virt_norm, proto.t()).max(dim=1).values
             virt_mean = virt_class_feats.mean(dim=0)
             virt_var = virt_class_feats.std(dim=0, unbiased=False).mean().item()
         else:
@@ -409,6 +464,7 @@ def main():
                 "train_support": int(real_idx.sum().item()),
                 "train_acc": float(train_acc[class_id].item()),
                 "virtual_count": int(alloc[class_id].item()),
+                "active_proto_count": int(class_proto_active.sum().item()),
                 "allocation_weight": float(alloc_weights[class_id].item()),
                 "proto_cos_mean": float(proto_cos.mean().item()) if proto_cos.numel() > 0 else float("nan"),
                 "proto_cos_std": float(proto_cos.std(unbiased=False).item()) if proto_cos.numel() > 0 else float("nan"),

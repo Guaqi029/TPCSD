@@ -13,7 +13,7 @@ from data.dataset import ISICDataset
 from data.transforms import Transforms
 from models import Projector, ResNetBackbone
 from utils.checkpoint_utils import load_state_dict_flexible
-from utils.losses import prototype_uniformity_loss
+from utils.losses import active_prototype_mask, ensure_3d_prototypes, prototype_uniformity_loss, reduce_prototypes_mean
 from utils.metrics import build_group_specs
 from visualize_embeddings import save_named_point_tsne, save_prototype_mean_tsne, save_similarity_heatmap
 
@@ -192,28 +192,31 @@ def main():
         load_state_dict_flexible(projector, args.projector_ckpt)
         feature_dim = inferred_proj_dim
 
-    prototypes = torch.load(args.prototype_ckpt, map_location="cpu").float()
-    if prototypes.shape[1] != feature_dim:
+    prototypes = ensure_3d_prototypes(torch.load(args.prototype_ckpt, map_location="cpu").float())
+    if prototypes.shape[-1] != feature_dim:
         raise ValueError(
-            f"prototype dim mismatch: checkpoint={prototypes.shape[1]}, expected={feature_dim}"
+            f"prototype dim mismatch: checkpoint={prototypes.shape[-1]}, expected={feature_dim}"
         )
+    proto_active_mask = active_prototype_mask(prototypes)
+    prototype_mean = reduce_prototypes_mean(prototypes, proto_active_mask)
 
     feats, labels = extract_features(encoder, projector, train_loader, device)
     means, stds = compute_class_stats(feats, labels, train_base.n_class)
 
-    prototypes_n = F.normalize(prototypes, dim=1)
+    prototypes_n = F.normalize(prototype_mean, dim=1)
     means_n = F.normalize(means, dim=1)
-    prototype_cosine_matrix = compute_prototype_cosine_matrix(prototypes)
+    prototype_cosine_matrix = compute_prototype_cosine_matrix(prototype_mean)
     prototype_cosine_summary = summarize_off_diagonal_similarity(
         prototype_cosine_matrix, list(train_base.class_names), threshold=0.8
     )
-    prototype_uniformity = float(prototype_uniformity_loss(prototypes, t=2.0).item())
+    flat_active_proto = prototypes[proto_active_mask]
+    prototype_uniformity = float(prototype_uniformity_loss(flat_active_proto, t=2.0).item()) if flat_active_proto.numel() > 0 else 0.0
 
     rows = []
     for class_id, class_name in enumerate(train_base.class_names):
         class_mask = labels == class_id
         class_feats = feats[class_mask]
-        proto = prototypes[class_id]
+        proto = prototype_mean[class_id]
         mean = means[class_id]
         proto_n = prototypes_n[class_id]
         mean_n = means_n[class_id]
@@ -240,6 +243,7 @@ def main():
                 "class_id": int(class_id),
                 "class_name": str(class_name),
                 "support": int(class_mask.sum().item()),
+                "active_proto_count": int(proto_active_mask[class_id].sum().item()),
                 "proto_mean_cosine": proto_mean_cosine,
                 "proto_mean_l2": proto_mean_l2,
                 "real_to_proto_cos_mean": float(real_to_proto_cos.mean().item()) if real_to_proto_cos.numel() > 0 else float("nan"),
@@ -283,6 +287,7 @@ def main():
             "class_means": means,
             "class_stds": stds,
             "prototypes": prototypes,
+            "prototype_mean": prototype_mean,
             "prototype_cosine_matrix": prototype_cosine_matrix,
         },
         os.path.join(output_dir, "feature_stats.pt"),
@@ -295,14 +300,14 @@ def main():
         title=f"{args.dataset} Prototype Cosine Similarity",
     )
     save_named_point_tsne(
-        features=prototypes,
+        features=prototype_mean,
         class_names=train_base.class_names,
         out_path=os.path.join(output_dir, "prototype_tsne.png"),
         title=f"{args.dataset} Prototype t-SNE",
         seed=args.seed,
     )
     save_prototype_mean_tsne(
-        prototypes=prototypes,
+        prototypes=prototype_mean,
         means=means,
         class_names=train_base.class_names,
         out_path=os.path.join(output_dir, "prototype_mean_tsne.png"),

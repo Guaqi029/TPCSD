@@ -23,6 +23,7 @@ IMAGE_SIZE="${IMAGE_SIZE:-224}"
 PRETRAINED="${PRETRAINED:-True}"
 RECAL_TAIL_FACTOR="${RECAL_TAIL_FACTOR:-1.0}"
 PROTO_SEP_MARGIN="${PROTO_SEP_MARGIN:-0.5}"
+NUM_PROTOTYPES_PER_CLASS="${NUM_PROTOTYPES_PER_CLASS:-1}"
 
 TRAIN_CSV="${SPLIT_DIR}/training.csv"
 VAL_CSV="${SPLIT_DIR}/validation.csv"
@@ -59,6 +60,7 @@ python train_stage1.py \
   "${PRETRAIN_FLAG}" \
   --use_projector \
   --proj_dim 128 \
+  --num_prototypes_per_class "${NUM_PROTOTYPES_PER_CLASS}" \
   --cls_loss ce \
   --pcd_weight 1.0 \
   --pcd_temp 0.05 \

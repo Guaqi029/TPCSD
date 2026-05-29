@@ -22,6 +22,7 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 EPOCHS="${EPOCHS:-100}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
 PRETRAINED="${PRETRAINED:-True}"
+NUM_PROTOTYPES_PER_CLASS="${NUM_PROTOTYPES_PER_CLASS:-1}"
 
 # Which experiment to run: baseline_best | no_punif | weak_punif
 EXP_NAME="${EXP_NAME:-baseline_best}"
@@ -90,6 +91,7 @@ python train_stage1.py \
   "${PRETRAIN_FLAG}" \
   --use_projector \
   --proj_dim 128 \
+  --num_prototypes_per_class "${NUM_PROTOTYPES_PER_CLASS}" \
   --cls_loss "${CLS_LOSS}" \
   --pcd_weight 1.0 \
   --pcd_temp 0.05 \

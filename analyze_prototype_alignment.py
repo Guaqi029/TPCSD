@@ -195,7 +195,7 @@ def main():
     prototypes = ensure_3d_prototypes(torch.load(args.prototype_ckpt, map_location="cpu").float())
     if prototypes.shape[-1] != feature_dim:
         raise ValueError(
-            f"prototype dim mismatch: checkpoint={prototypes.shape[-1]}, expected={feature_dim}"
+            f"prototype dim mismatch: checkpoint={prototypes.shape[1]}, expected={feature_dim}"
         )
     proto_active_mask = active_prototype_mask(prototypes)
     prototype_mean = reduce_prototypes_mean(prototypes, proto_active_mask)

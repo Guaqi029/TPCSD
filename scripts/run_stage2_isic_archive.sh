@@ -30,7 +30,9 @@ VIRTUAL_CONF_THRESH="${VIRTUAL_CONF_THRESH:-0.6}"
 VIRTUAL_CENTER_COS_THRESH="${VIRTUAL_CENTER_COS_THRESH:-0.2}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
 STAGE1_RUN_DIR="${STAGE1_RUN_DIR:-}"
-CKPT_TAG="${CKPT_TAG:-best}"
+# Stage1 checkpoint tag to bootstrap Stage2.
+# Supported tags now include: best(=best_val), best_val, best_test, latest.
+STAGE1_CKPT_TAG="${STAGE1_CKPT_TAG:-${CKPT_TAG:-best}}"
 
 TRAIN_CSV="${SPLIT_DIR}/training.csv"
 VAL_CSV="${SPLIT_DIR}/validation.csv"
@@ -47,9 +49,9 @@ fi
 
 [[ -n "${STAGE1_RUN_DIR}" ]] || { echo "Could not resolve latest Stage1 run dir." >&2; exit 1; }
 
-ENCODER_CKPT="${STAGE1_RUN_DIR}/resnet_encoder_${CKPT_TAG}.pth"
-PROTOTYPE_CKPT="${STAGE1_RUN_DIR}/prototype_memory_${CKPT_TAG}.pth"
-PROJECTOR_CKPT="${STAGE1_RUN_DIR}/projector_${CKPT_TAG}.pth"
+ENCODER_CKPT="${STAGE1_RUN_DIR}/resnet_encoder_${STAGE1_CKPT_TAG}.pth"
+PROTOTYPE_CKPT="${STAGE1_RUN_DIR}/prototype_memory_${STAGE1_CKPT_TAG}.pth"
+PROJECTOR_CKPT="${STAGE1_RUN_DIR}/projector_${STAGE1_CKPT_TAG}.pth"
 
 [[ -f "${ENCODER_CKPT}" ]] || { echo "Missing encoder_ckpt: ${ENCODER_CKPT}" >&2; exit 1; }
 [[ -f "${PROJECTOR_CKPT}" ]] || { echo "Missing projector_ckpt: ${PROJECTOR_CKPT}" >&2; exit 1; }

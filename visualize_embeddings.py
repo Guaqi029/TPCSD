@@ -320,6 +320,95 @@ def save_real_virtual_tsne(
     return True
 
 
+def save_split_umap_plot(
+    features,
+    labels,
+    splits,
+    class_names,
+    out_path,
+    csv_path,
+    title="Train / Val / Test UMAP",
+    seed=42,
+):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return False
+
+    try:
+        from umap import UMAP
+    except ImportError as exc:
+        raise ImportError("UMAP visualization requires the `umap-learn` package.") from exc
+
+    features = _to_numpy(features)
+    labels = _to_numpy(labels).astype(np.int64)
+    splits = np.asarray(splits)
+
+    if features.shape[0] < 2:
+        return False
+
+    embedding = UMAP(
+        n_components=2,
+        random_state=seed,
+        n_neighbors=min(15, max(2, features.shape[0] - 1)),
+        min_dist=0.1,
+        metric="euclidean",
+    ).fit_transform(features)
+
+    marker_map = {
+        "train": "o",
+        "val": "^",
+        "test": "s",
+    }
+    split_order = ["train", "val", "test"]
+    unique_labels = np.unique(labels)
+    cmap = plt.cm.get_cmap("tab20", max(20, len(class_names), len(unique_labels)))
+
+    fig, ax = plt.subplots(figsize=(10, 8), dpi=150)
+    for color_idx, class_id in enumerate(unique_labels):
+        class_mask = labels == class_id
+        color = cmap(color_idx)
+        for split_name in split_order:
+            split_mask = splits == split_name
+            mask = class_mask & split_mask
+            if not np.any(mask):
+                continue
+            ax.scatter(
+                embedding[mask, 0],
+                embedding[mask, 1],
+                s=10,
+                alpha=0.72,
+                color=color,
+                marker=marker_map[split_name],
+                linewidths=0,
+            )
+
+    marker_handles = []
+    for split_name in split_order:
+        marker_handles.append(
+            ax.scatter([], [], color="black", marker=marker_map[split_name], s=42, label=split_name)
+        )
+    ax.legend(handles=marker_handles, title="split", loc="best", frameon=False)
+    ax.set_title(title)
+    ax.set_xlabel("UMAP-1")
+    ax.set_ylabel("UMAP-2")
+    ax.grid(True, alpha=0.15)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+    rows = {
+        "x": embedding[:, 0],
+        "y": embedding[:, 1],
+        "label": labels,
+        "split": splits,
+    }
+    import pandas as pd
+
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--features", required=True)

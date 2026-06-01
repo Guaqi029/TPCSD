@@ -20,6 +20,7 @@ BATCH_SIZE="${BATCH_SIZE:-256}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
 RUN_DIR="${RUN_DIR:-}"
+# Supported tags: best(=best_val), best_val, best_test, latest.
 CKPT_TAG="${CKPT_TAG:-best}"
 
 TRAIN_CSV="${LT_SPLIT_ROOT}/shared_eval_seed${SEED}/training_if${FACTOR}.csv"

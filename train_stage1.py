@@ -33,8 +33,10 @@ from utils.metrics import (
     compute_per_class_metrics,
     format_tail_lines,
     plot_loss_curve,
+    plot_total_acc_curves,
     plot_group_curves,
     update_loss_history,
+    update_total_acc_history,
     update_curve_history,
 )
 
@@ -49,6 +51,7 @@ from utils.losses import (
     enqueue_feature_queue,
     pcd_loss,
     prototype_nearest_neighbor_separation_loss,
+    prototype_uniformity_loss,
     recalibrate_prototypes,
     sp_kd_loss,
 )
@@ -189,7 +192,6 @@ def main():
     parser.add_argument("--use_projector", action="store_true")
     parser.add_argument("--proj_dim", type=int, default=128)
     parser.add_argument("--proj_hidden_dim", type=int, default=0)
-    parser.add_argument("--num_prototypes_per_class", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--momentum", type=float, default=0.9)
@@ -234,11 +236,15 @@ def main():
     test_base = ISICDataset(args.data_path, args.csv_file_test, transform=None)
 
     train_ds = PairTransformDataset(train_base, transforms)
+    train_eval_ds = SingleTransformDataset(train_base, transforms.test_transform)
     val_ds = SingleTransformDataset(val_base, transforms.test_transform)
     test_ds = SingleTransformDataset(test_base, transforms.test_transform)
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, drop_last=True
+    )
+    train_eval_loader = DataLoader(
+        train_eval_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True
     )
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
@@ -312,16 +318,24 @@ def main():
         "train": {"epoch": [], "loss": []},
         "val": {"epoch": [], "acc": [], "bac": []},
         "test": {"epoch": [], "acc": [], "bac": []},
+        "overall_acc": {"epoch": [], "train": [], "val": [], "test": []},
     }
 
-    num_proto = int(args.num_prototypes_per_class)
-    prototypes = torch.zeros(num_classes, num_proto, proj_dim, device=device)
+    prototypes = torch.zeros(num_classes, proj_dim, device=device)
     student_queue = torch.zeros(args.queue_size, proj_dim, device=device)
     teacher_queue = torch.zeros(args.queue_size, proj_dim, device=device)
     label_queue = torch.full((args.queue_size,), -1, dtype=torch.long, device=device)
     prototype_seen = torch.zeros(num_classes, num_proto, dtype=torch.bool, device=device)
 
+    def save_stage1_bundle(tag):
+        torch.save(encoder.state_dict(), os.path.join(ckpt_root, f"resnet_encoder_{tag}.pth"))
+        torch.save(classifier.state_dict(), os.path.join(ckpt_root, f"classifier_{tag}.pth"))
+        if projector is not None:
+            torch.save(projector.state_dict(), os.path.join(ckpt_root, f"projector_{tag}.pth"))
+        torch.save(prototypes, os.path.join(ckpt_root, f"prototype_memory_{tag}.pth"))
+
     best_val_acc = -1.0
+    best_test_acc = -1.0
     for epoch in range(1, args.epochs + 1):
         encoder.train()
         classifier.train()
@@ -457,8 +471,10 @@ def main():
             margin=args.proto_sep_margin,
             active_mask=prototype_seen.reshape(-1),
         ).item()
+        train_metrics, train_per_class = evaluate(encoder, classifier, train_eval_loader, device, num_classes)
         val_metrics, val_per_class = evaluate(encoder, classifier, val_loader, device, num_classes)
         test_metrics, test_per_class = evaluate(encoder, classifier, test_loader, device, num_classes)
+        train_acc, train_f1, train_auc, train_bac, train_bacc, train_sens, train_spec = train_metrics
         val_acc, val_f1, val_auc, val_bac, val_bacc, val_sens, val_spec = val_metrics
         test_acc, test_f1, test_auc, test_bac, test_bacc, test_sens, test_spec = test_metrics
 
@@ -467,9 +483,11 @@ def main():
         update_loss_history(curve_history, epoch, train_loss)
         update_curve_history(curve_history, epoch, "val", val_per_class, group_specs)
         update_curve_history(curve_history, epoch, "test", test_per_class, group_specs)
+        update_total_acc_history(curve_history, epoch, train_acc, val_acc, test_acc)
         plot_loss_curve(curve_history, os.path.join(ckpt_root, "train_loss_curve.png"), title="Stage1 Train Loss")
         plot_group_curves(curve_history, os.path.join(ckpt_root, "val_group_curves.png"), "val")
         plot_group_curves(curve_history, os.path.join(ckpt_root, "test_group_curves.png"), "test")
+        plot_total_acc_curves(curve_history, os.path.join(ckpt_root, "overall_acc_curves.png"), title="Stage1 Overall Accuracy")
 
         log_line = (
             f"Epoch {epoch}/{args.epochs} "
@@ -482,6 +500,7 @@ def main():
             f"proto_unif={proto_uniformity_eval:.6f} "
             f"proto_mean_cos={proto_mean_cos:.6f} "
             f"proto_max_cos={proto_max_cos:.6f} "
+            f"train_acc={train_acc:.6f} train_bac={train_bac:.6f} train_bacc={train_bacc:.6f} "
             f"val_acc={val_acc:.6f} val_bac={val_bac:.6f} val_bacc={val_bacc:.6f} "
             f"test_acc={test_acc:.6f} test_bac={test_bac:.6f} test_bacc={test_bacc:.6f}"
         )
@@ -497,31 +516,20 @@ def main():
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(encoder.state_dict(), os.path.join(ckpt_root, "resnet_encoder_best.pth"))
-            torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_best.pth"))
-            if projector is not None:
-                torch.save(projector.state_dict(), os.path.join(ckpt_root, "projector_best.pth"))
-            torch.save(serialize_prototypes_for_checkpoint(prototypes), os.path.join(ckpt_root, "prototype_memory_best.pth"))
+            save_stage1_bundle("best")
+            save_stage1_bundle("best_val")
+
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc
+            save_stage1_bundle("best_test")
 
         if args.cls_loss == "deferred_balanced_softmax":
             if args.cls_warmup_epochs > 1 and epoch == args.cls_warmup_epochs - 1:
-                torch.save(encoder.state_dict(), os.path.join(ckpt_root, "resnet_encoder_pre_switch.pth"))
-                torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_pre_switch.pth"))
-                if projector is not None:
-                    torch.save(projector.state_dict(), os.path.join(ckpt_root, "projector_pre_switch.pth"))
-                torch.save(serialize_prototypes_for_checkpoint(prototypes), os.path.join(ckpt_root, "prototype_memory_pre_switch.pth"))
+                save_stage1_bundle("pre_switch")
             if epoch == args.cls_warmup_epochs:
-                torch.save(encoder.state_dict(), os.path.join(ckpt_root, "resnet_encoder_switch_epoch.pth"))
-                torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_switch_epoch.pth"))
-                if projector is not None:
-                    torch.save(projector.state_dict(), os.path.join(ckpt_root, "projector_switch_epoch.pth"))
-                torch.save(serialize_prototypes_for_checkpoint(prototypes), os.path.join(ckpt_root, "prototype_memory_switch_epoch.pth"))
+                save_stage1_bundle("switch_epoch")
 
-        torch.save(encoder.state_dict(), os.path.join(ckpt_root, "resnet_encoder_latest.pth"))
-        torch.save(classifier.state_dict(), os.path.join(ckpt_root, "classifier_latest.pth"))
-        if projector is not None:
-            torch.save(projector.state_dict(), os.path.join(ckpt_root, "projector_latest.pth"))
-        torch.save(serialize_prototypes_for_checkpoint(prototypes), os.path.join(ckpt_root, "prototype_memory_latest.pth"))
+        save_stage1_bundle("latest")
 
 
 if __name__ == "__main__":

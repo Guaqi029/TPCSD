@@ -91,7 +91,6 @@ python train_stage1.py \
   "${PRETRAIN_FLAG}" \
   --use_projector \
   --proj_dim 128 \
-  --num_prototypes_per_class "${NUM_PROTOTYPES_PER_CLASS}" \
   --cls_loss "${CLS_LOSS}" \
   --pcd_weight 1.0 \
   --pcd_temp 0.05 \

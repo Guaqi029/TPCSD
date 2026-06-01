@@ -25,9 +25,11 @@ from utils.metrics import (
     compute_per_class_metrics,
     format_tail_lines,
     plot_loss_curve,
+    plot_total_acc_curves,
     plot_group_curves,
     update_curve_history,
     update_loss_history,
+    update_total_acc_history,
 )
 
 
@@ -467,11 +469,9 @@ def main():
     for p in projector.parameters():
         p.requires_grad = False
 
-    prototypes = ensure_3d_prototypes(torch.load(args.prototype_ckpt, map_location="cpu").float())
-    if prototypes.shape[-1] != args.proj_dim:
+    prototypes = torch.load(args.prototype_ckpt, map_location="cpu").float()
+    if prototypes.shape[1] != args.proj_dim:
         raise ValueError("prototype dimension mismatch with projector output dimension")
-    proto_active_mask = active_prototype_mask(prototypes)
-    prototype_mean = reduce_prototypes_mean(prototypes, proto_active_mask)
 
     classifier = CosineClassifier(args.proj_dim, num_classes, scale=args.cosine_scale).to(device)
     with torch.no_grad():
@@ -514,12 +514,20 @@ def main():
         "train": {"epoch": [], "loss": []},
         "val": {"epoch": [], "acc": [], "bac": []},
         "test": {"epoch": [], "acc": [], "bac": []},
+        "overall_acc": {"epoch": [], "train": [], "val": [], "test": []},
     }
 
+    def save_stage2_bundle(tag, mu_tensor, sigma_tensor, shared_cov_tensor):
+        torch.save(unwrap_model(classifier).state_dict(), os.path.join(ckpt_root, f"classifier_{tag}.pth"))
+        torch.save(unwrap_model(projector).state_dict(), os.path.join(ckpt_root, f"projector_{tag}.pth"))
+        torch.save(mu_tensor.cpu(), os.path.join(ckpt_root, f"gaussian_mu_{tag}.pth"))
+        torch.save(sigma_tensor.cpu(), os.path.join(ckpt_root, f"gaussian_sigma_{tag}.pth"))
+        torch.save(shared_cov_tensor.cpu(), os.path.join(ckpt_root, f"shared_cov_{tag}.pth"))
+
     best_val_acc = -1.0
+    best_test_acc = -1.0
     prev_stats = None
     proto = prototypes.to(device)
-    proto_active_mask = proto_active_mask.to(device)
     train_proj_feats = project_feature_tensor(projector, train_backbone_feats, device, args.stage2_batch_size)
     val_proj_feats = project_feature_tensor(projector, val_backbone_feats, device, args.stage2_batch_size)
     test_proj_feats = project_feature_tensor(projector, test_backbone_feats, device, args.stage2_batch_size)
@@ -665,6 +673,7 @@ def main():
             virtual_cls_sum += virt_cls_loss.item()
             step_count += 1
 
+        train_metrics, train_per_class = evaluate_classifier(classifier, train_proj_feats, train_labels, device, num_classes)
         val_metrics, val_per_class = evaluate_classifier(classifier, val_proj_feats, val_labels, device, num_classes)
         test_metrics, test_per_class = evaluate_classifier(classifier, test_proj_feats, test_labels, device, num_classes)
 
@@ -673,15 +682,18 @@ def main():
         train_virtual_loss = virtual_cls_sum / max(1, step_count)
         train_anchor_loss = 0.0
         hardest_names = [train_base.class_names[int(idx)] for idx in hardest_indices.tolist()]
+        train_acc, train_f1, train_auc, train_bac, train_bacc, train_sens, train_spec = train_metrics
 
         append_per_class_records(per_class_csv, epoch, "val", val_per_class, train_base.class_names)
         append_per_class_records(per_class_csv, epoch, "test", test_per_class, train_base.class_names)
         update_loss_history(curve_history, epoch, train_loss)
         update_curve_history(curve_history, epoch, "val", val_per_class, group_specs)
         update_curve_history(curve_history, epoch, "test", test_per_class, group_specs)
+        update_total_acc_history(curve_history, epoch, train_acc, val_metrics[0], test_metrics[0])
         plot_loss_curve(curve_history, os.path.join(ckpt_root, "train_loss_curve.png"), title="Stage2 Train Loss")
         plot_group_curves(curve_history, os.path.join(ckpt_root, "val_group_curves.png"), "val")
         plot_group_curves(curve_history, os.path.join(ckpt_root, "test_group_curves.png"), "test")
+        plot_total_acc_curves(curve_history, os.path.join(ckpt_root, "overall_acc_curves.png"), title="Stage2 Overall Accuracy")
 
         log_line = (
             f"Epoch {epoch}/{args.epochs} "
@@ -694,6 +706,7 @@ def main():
             f"final_virtual={final_kept}/{final_total} "
             f"cov_scale={args.cov_scale_factor:.4f} "
             f"cos_scale={args.cosine_scale:.4f} "
+            f"train_acc={train_acc:.6f} train_bac={train_bac:.6f} train_bacc={train_bacc:.6f} "
             f"val_acc={val_metrics[0]:.6f} val_bac={val_metrics[3]:.6f} val_bacc={val_metrics[4]:.6f} "
             f"test_acc={test_metrics[0]:.6f} test_bac={test_metrics[3]:.6f} test_bacc={test_metrics[4]:.6f}"
         )
@@ -763,17 +776,14 @@ def main():
 
         if val_metrics[0] > best_val_acc:
             best_val_acc = val_metrics[0]
-            torch.save(unwrap_model(classifier).state_dict(), os.path.join(ckpt_root, "classifier_best.pth"))
-            torch.save(unwrap_model(projector).state_dict(), os.path.join(ckpt_root, "projector_best.pth"))
-            torch.save(mu.cpu(), os.path.join(ckpt_root, "gaussian_mu_best.pth"))
-            torch.save(sigma.cpu(), os.path.join(ckpt_root, "gaussian_sigma_best.pth"))
-            torch.save(shared_cov.cpu(), os.path.join(ckpt_root, "shared_cov_best.pth"))
+            save_stage2_bundle("best", mu, sigma, shared_cov)
+            save_stage2_bundle("best_val", mu, sigma, shared_cov)
 
-        torch.save(unwrap_model(classifier).state_dict(), os.path.join(ckpt_root, "classifier_latest.pth"))
-        torch.save(unwrap_model(projector).state_dict(), os.path.join(ckpt_root, "projector_latest.pth"))
-        torch.save(mu.cpu(), os.path.join(ckpt_root, "gaussian_mu_latest.pth"))
-        torch.save(sigma.cpu(), os.path.join(ckpt_root, "gaussian_sigma_latest.pth"))
-        torch.save(shared_cov.cpu(), os.path.join(ckpt_root, "shared_cov_latest.pth"))
+        if test_metrics[0] > best_test_acc:
+            best_test_acc = test_metrics[0]
+            save_stage2_bundle("best_test", mu, sigma, shared_cov)
+
+        save_stage2_bundle("latest", mu, sigma, shared_cov)
 
 
 if __name__ == "__main__":

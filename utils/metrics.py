@@ -239,6 +239,39 @@ def update_loss_history(history, epoch, loss_value):
     history["train"]["loss"].append(float(loss_value))
 
 
+def update_total_acc_history(history, epoch, train_acc, val_acc, test_acc):
+    history["overall_acc"]["epoch"].append(int(epoch))
+    history["overall_acc"]["train"].append(float(train_acc))
+    history["overall_acc"]["val"].append(float(val_acc))
+    history["overall_acc"]["test"].append(float(test_acc))
+
+
+def plot_total_acc_curves(history, out_path, title="Overall Accuracy"):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    acc_history = history.get("overall_acc", {})
+    epochs = acc_history.get("epoch", [])
+    if not epochs:
+        return
+
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=140)
+    for split_name, color in (("train", "#1f77b4"), ("val", "#ff7f0e"), ("test", "#2ca02c")):
+        values = acc_history.get(split_name, [])
+        if values:
+            ax.plot(epochs, values, label=split_name, linewidth=1.8, color=color)
+    ax.set_title(title)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("ACC")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
 def plot_loss_curve(history, out_path, title="Train Loss"):
     try:
         import matplotlib.pyplot as plt

@@ -109,21 +109,6 @@ def compute_per_class_acc(classifier, feats, labels, num_classes, device):
     return acc
 
 
-def compute_prototype_per_class_acc(feats, labels, prototypes, num_classes, device):
-    with torch.no_grad():
-        x = F.normalize(feats.to(device), p=2, dim=1)
-        proto = F.normalize(ensure_3d_prototypes(prototypes).to(device), p=2, dim=2)
-        scores = torch.einsum("bd,ckd->bck", x, proto).max(dim=2).values
-        pred = scores.argmax(dim=1).cpu()
-    acc = torch.zeros(num_classes, dtype=torch.float32)
-    for class_id in range(num_classes):
-        idx = labels == class_id
-        if idx.sum() == 0:
-            continue
-        acc[class_id] = (pred[idx] == class_id).float().mean()
-    return acc
-
-
 def softmax_alloc(acc, alpha, total):
     scores = torch.exp(alpha * (1.0 - acc))
     weights = scores / scores.sum()
@@ -302,8 +287,6 @@ def main():
     parser.add_argument("--proj_hidden_dim", type=int, default=0)
     parser.add_argument("--aas_alpha", type=float, default=2.0)
     parser.add_argument("--virtual_ratio", type=float, default=1.0)
-    parser.add_argument("--hardest_k", type=int, default=3)
-    parser.add_argument("--hardest_fraction", type=float, default=0.5)
     parser.add_argument("--lambda_mu", type=float, default=0.5)
     parser.add_argument("--gamma_proto", type=float, default=0.2)
     parser.add_argument("--delta_noise", type=float, default=0.01)
@@ -386,9 +369,7 @@ def main():
     if args.prototype_ckpt and os.path.isfile(args.prototype_ckpt):
         prototypes = ensure_3d_prototypes(torch.load(args.prototype_ckpt, map_location="cpu").float())
     else:
-        prototypes = torch.zeros(len(class_names), 1, feature_dim, dtype=torch.float32)
-    proto_active_mask = active_prototype_mask(prototypes)
-    prototype_mean = reduce_prototypes_mean(prototypes, proto_active_mask)
+        prototypes = torch.zeros(len(class_names), feature_dim, dtype=torch.float32)
 
     mu = mu.to(device)
     sigma = sigma.to(device)
@@ -415,8 +396,7 @@ def main():
     test_metrics, test_per_class = evaluate_classifier(classifier, test_feats, test_labels, device, len(class_names))
     train_acc = compute_prototype_per_class_acc(train_feats, train_labels, prototypes, len(class_names), device)
     virtual_total = int(len(train_labels) * float(args.virtual_ratio))
-    hardest_indices = select_hardest_classes(train_acc, args.hardest_k, args.hardest_fraction)
-    alloc, alloc_weights = allocate_hardest_virtual_counts(train_acc, hardest_indices, args.aas_alpha, virtual_total)
+    alloc, alloc_weights = softmax_alloc(train_acc, args.aas_alpha, virtual_total)
     if args.shared_cov_ckpt and os.path.isfile(args.shared_cov_ckpt):
         virt_feats, virt_labels = sample_virtual_features_shared_cov(
             mu_tilde,

@@ -24,7 +24,7 @@ from utils.metrics import (
     format_tail_lines,
     plot_loss_curve_from_log,
 )
-from visualize_embeddings import save_tsne_plot
+from visualize_embeddings import save_split_umap_plot, save_tsne_plot
 
 
 class SingleTransformDataset(Dataset):
@@ -114,9 +114,17 @@ def main():
     tail_classes = [int(x) for x in tail_classes.tolist()]
 
     transforms = Transforms(args.image_size)
+    train_base = ISICDataset(args.data_path, args.csv_file_train, transform=None)
     val_base = ISICDataset(args.data_path, args.csv_file_val, transform=None)
     test_base = ISICDataset(args.data_path, args.csv_file_test, transform=None)
 
+    train_loader = DataLoader(
+        SingleTransformDataset(train_base, transforms.test_transform),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=True,
+    )
     val_loader = DataLoader(
         SingleTransformDataset(val_base, transforms.test_transform),
         batch_size=args.batch_size,
@@ -137,6 +145,9 @@ def main():
     load_state_dict_flexible(encoder, args.encoder_ckpt)
     load_state_dict_flexible(classifier, args.classifier_ckpt)
 
+    train_metrics, train_per_class, train_features, train_labels = evaluate(
+        encoder, classifier, train_loader, device, len(class_names)
+    )
     val_metrics, val_per_class, val_features, val_labels = evaluate(encoder, classifier, val_loader, device, len(class_names))
     test_metrics, test_per_class, test_features, test_labels = evaluate(
         encoder, classifier, test_loader, device, len(class_names)
@@ -153,6 +164,7 @@ def main():
 
     output_dir = args.output_dir or os.path.join(os.path.dirname(args.encoder_ckpt), "offline_eval_stage1")
     os.makedirs(output_dir, exist_ok=True)
+    checkpoint_dir = os.path.dirname(args.encoder_ckpt)
     run_dir = os.path.dirname(args.encoder_ckpt)
     run_name = os.path.basename(run_dir)
     repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -200,8 +212,25 @@ def main():
     with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
+    torch.save({"features": train_features, "labels": train_labels}, os.path.join(output_dir, "train_embeddings.pt"))
     torch.save({"features": val_features, "labels": val_labels}, os.path.join(output_dir, "val_embeddings.pt"))
     torch.save({"features": test_features, "labels": test_labels}, os.path.join(output_dir, "test_embeddings.pt"))
+    merged_features = torch.cat([train_features, val_features, test_features], dim=0)
+    merged_labels = torch.cat([train_labels, val_labels, test_labels], dim=0)
+    merged_splits = np.asarray(
+        ["train"] * int(train_features.shape[0]) + ["val"] * int(val_features.shape[0]) + ["test"] * int(test_features.shape[0]),
+        dtype=object,
+    )
+    save_split_umap_plot(
+        features=merged_features,
+        labels=merged_labels,
+        splits=merged_splits,
+        class_names=class_names,
+        out_path=os.path.join(checkpoint_dir, "umap_train_val_test.png"),
+        csv_path=os.path.join(checkpoint_dir, "umap_train_val_test.csv"),
+        title=f"{args.dataset} Train / Val / Test UMAP",
+        seed=args.seed,
+    )
     save_tsne_plot(
         features=val_features,
         labels=val_labels,
@@ -226,6 +255,11 @@ def main():
         title="Stage1 Train Loss",
     )
 
+    print(
+        "train: "
+        f"acc={train_metrics[0]:.6f}, f1={train_metrics[1]:.6f}, auc={train_metrics[2]:.6f}, "
+        f"bac={train_metrics[3]:.6f}, bacc={compute_macro_metric(train_per_class, metric_key='bacc'):.6f}"
+    )
     print(
         "val: "
         f"acc={val_metrics[0]:.6f}, f1={val_metrics[1]:.6f}, auc={val_metrics[2]:.6f}, "
@@ -252,6 +286,8 @@ def main():
         print(line)
     if os.path.isfile(inferred_log_path):
         print(f"train_loss_curve: {os.path.join(output_dir, 'train_loss_curve.png')}")
+    print(f"umap_train_val_test: {os.path.join(checkpoint_dir, 'umap_train_val_test.png')}")
+    print(f"umap_train_val_test_csv: {os.path.join(checkpoint_dir, 'umap_train_val_test.csv')}")
     print(f"val_tsne: {os.path.join(output_dir, 'val_tsne.png')}")
     print(f"test_tsne: {os.path.join(output_dir, 'test_tsne.png')}")
     print(f"saved to: {output_dir}")

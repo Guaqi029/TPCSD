@@ -21,6 +21,7 @@ NUM_WORKERS="${NUM_WORKERS:-8}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
 STAGE1_RUN_DIR="${STAGE1_RUN_DIR:-}"
 STAGE2_RUN_DIR="${STAGE2_RUN_DIR:-}"
+# Supported tags: best(=best_val), best_val, best_test, latest.
 STAGE1_CKPT_TAG="${STAGE1_CKPT_TAG:-best}"
 STAGE2_CKPT_TAG="${STAGE2_CKPT_TAG:-best}"
 

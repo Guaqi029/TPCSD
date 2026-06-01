@@ -29,11 +29,17 @@ fi
 [[ -f "${RUN_DIR}/resnet_encoder_latest.pth" ]] || { echo "Missing encoder checkpoint in ${RUN_DIR}" >&2; exit 1; }
 [[ -f "${RUN_DIR}/prototype_memory_latest.pth" ]] || { echo "Missing prototype checkpoint in ${RUN_DIR}" >&2; exit 1; }
 
+PROJECTOR_CKPT=""
+if [[ -f "${RUN_DIR}/projector_latest.pth" ]]; then
+  PROJECTOR_CKPT="${RUN_DIR}/projector_latest.pth"
+fi
+
 python analyze_prototype_alignment.py \
   --dataset ISIC_Archive \
   --data_path "${DATA_ROOT}" \
   --csv_file_train "${TRAIN_CSV}" \
   --encoder_ckpt "${RUN_DIR}/resnet_encoder_latest.pth" \
+  --projector_ckpt "${PROJECTOR_CKPT}" \
   --prototype_ckpt "${RUN_DIR}/prototype_memory_latest.pth" \
   --backbone medclip_vit \
   --image_size "${IMAGE_SIZE}" \

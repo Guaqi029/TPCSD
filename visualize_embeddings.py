@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 
 import numpy as np
 import torch
@@ -55,6 +56,31 @@ def _compute_tsne_embedding(features, seed=42, small_n_perplexity=5):
         learning_rate="auto",
         random_state=seed,
     ).fit_transform(features)
+
+
+def _compute_umap_embedding(features, seed=42):
+    try:
+        from umap import UMAP
+    except ImportError as exc:
+        raise ImportError("UMAP visualization requires the `umap-learn` package.") from exc
+
+    features = _to_numpy(features)
+    if features.shape[0] < 2:
+        raise ValueError("Need at least two points to compute a 2D embedding.")
+    if features.shape[0] == 2:
+        return np.asarray([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+
+    return UMAP(
+        n_components=2,
+        random_state=seed,
+        n_neighbors=min(15, max(2, features.shape[0] - 1)),
+        min_dist=0.1,
+        metric="euclidean",
+    ).fit_transform(features)
+
+
+def _sanitize_name_for_path(name):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "unknown"
 
 
 def save_tsne_plot(features, labels, class_names, out_path, title="", max_points=4000, seed=42):
@@ -335,11 +361,6 @@ def save_split_umap_plot(
     except ImportError:
         return False
 
-    try:
-        from umap import UMAP
-    except ImportError as exc:
-        raise ImportError("UMAP visualization requires the `umap-learn` package.") from exc
-
     features = _to_numpy(features)
     labels = _to_numpy(labels).astype(np.int64)
     splits = np.asarray(splits)
@@ -347,13 +368,7 @@ def save_split_umap_plot(
     if features.shape[0] < 2:
         return False
 
-    embedding = UMAP(
-        n_components=2,
-        random_state=seed,
-        n_neighbors=min(15, max(2, features.shape[0] - 1)),
-        min_dist=0.1,
-        metric="euclidean",
-    ).fit_transform(features)
+    embedding = _compute_umap_embedding(features, seed=seed)
 
     marker_map = {
         "train": "o",
@@ -407,6 +422,95 @@ def save_split_umap_plot(
 
     pd.DataFrame(rows).to_csv(csv_path, index=False)
     return True
+
+
+def save_per_class_split_umap_plots(
+    features,
+    labels,
+    splits,
+    class_names,
+    out_dir,
+    tag_suffix="",
+    title_prefix="Per-class UMAP",
+    seed=42,
+):
+    try:
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except ImportError:
+        return []
+
+    features = _to_numpy(features)
+    labels = _to_numpy(labels).astype(np.int64)
+    splits = np.asarray(splits)
+    class_names = list(class_names)
+    os.makedirs(out_dir, exist_ok=True)
+
+    split_order = ["train", "val", "test"]
+    marker_map = {"train": "o", "val": "^", "test": "s"}
+    color_map = {"train": "#1f77b4", "val": "#ff7f0e", "test": "#2ca02c"}
+    saved = []
+
+    for class_id in np.unique(labels):
+        class_mask = labels == int(class_id)
+        class_features = features[class_mask]
+        class_splits = splits[class_mask]
+        if class_features.shape[0] < 2:
+            continue
+
+        try:
+            embedding = _compute_umap_embedding(class_features, seed=seed)
+        except ValueError:
+            continue
+
+        class_name = class_names[int(class_id)] if int(class_id) < len(class_names) else str(class_id)
+        class_slug = _sanitize_name_for_path(class_name)
+        stem = f"umap_class_{class_slug}"
+        if tag_suffix:
+            stem = f"{stem}_{tag_suffix}"
+        out_path = os.path.join(out_dir, f"{stem}.png")
+        csv_path = os.path.join(out_dir, f"{stem}.csv")
+
+        fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
+        marker_handles = []
+        for split_name in split_order:
+            split_mask = class_splits == split_name
+            if not np.any(split_mask):
+                continue
+            ax.scatter(
+                embedding[split_mask, 0],
+                embedding[split_mask, 1],
+                s=12,
+                alpha=0.78,
+                color=color_map[split_name],
+                marker=marker_map[split_name],
+                linewidths=0,
+            )
+            marker_handles.append(
+                ax.scatter([], [], color=color_map[split_name], marker=marker_map[split_name], s=42, label=split_name)
+            )
+
+        if marker_handles:
+            ax.legend(handles=marker_handles, title="split", loc="best", frameon=False)
+        ax.set_title(f"{title_prefix}: {class_name}")
+        ax.set_xlabel("UMAP-1")
+        ax.set_ylabel("UMAP-2")
+        ax.grid(True, alpha=0.15)
+        fig.tight_layout()
+        fig.savefig(out_path, bbox_inches="tight")
+        plt.close(fig)
+
+        pd.DataFrame(
+            {
+                "x": embedding[:, 0],
+                "y": embedding[:, 1],
+                "label": np.full(class_features.shape[0], int(class_id), dtype=np.int64),
+                "split": class_splits,
+            }
+        ).to_csv(csv_path, index=False)
+        saved.append((class_name, out_path, csv_path))
+
+    return saved
 
 
 def main():

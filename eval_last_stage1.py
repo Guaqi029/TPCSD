@@ -24,7 +24,7 @@ from utils.metrics import (
     format_tail_lines,
     plot_loss_curve_from_log,
 )
-from visualize_embeddings import save_split_umap_plot, save_tsne_plot
+from visualize_embeddings import save_per_class_split_umap_plots, save_split_umap_plot, save_tsne_plot
 
 
 class SingleTransformDataset(Dataset):
@@ -60,6 +60,18 @@ def build_class_counts(csv_file):
         }
     ).astype(int)
     return labels.sum(axis=0).to_numpy(dtype=np.int64), list(frame.columns[1:])
+
+
+def infer_ckpt_tag_from_path(ckpt_path, prefix):
+    basename = os.path.basename(ckpt_path)
+    stem, _ = os.path.splitext(basename)
+    if stem.startswith(prefix):
+        stem = stem[len(prefix):]
+    return stem or "unknown"
+
+
+def normalize_tag_for_filename(tag):
+    return str(tag).replace("_", "")
 
 
 def evaluate(encoder, classifier, loader, device, num_classes):
@@ -165,6 +177,12 @@ def main():
     output_dir = args.output_dir or os.path.join(os.path.dirname(args.encoder_ckpt), "offline_eval_stage1")
     os.makedirs(output_dir, exist_ok=True)
     checkpoint_dir = os.path.dirname(args.encoder_ckpt)
+    umap_dir = os.path.join(checkpoint_dir, "umap")
+    os.makedirs(umap_dir, exist_ok=True)
+    per_class_umap_dir = os.path.join(umap_dir, "per_class")
+    os.makedirs(per_class_umap_dir, exist_ok=True)
+    ckpt_tag = infer_ckpt_tag_from_path(args.encoder_ckpt, "resnet_encoder_")
+    ckpt_tag_slug = normalize_tag_for_filename(ckpt_tag)
     run_dir = os.path.dirname(args.encoder_ckpt)
     run_name = os.path.basename(run_dir)
     repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -226,9 +244,19 @@ def main():
         labels=merged_labels,
         splits=merged_splits,
         class_names=class_names,
-        out_path=os.path.join(checkpoint_dir, "umap_train_val_test.png"),
-        csv_path=os.path.join(checkpoint_dir, "umap_train_val_test.csv"),
-        title=f"{args.dataset} Train / Val / Test UMAP",
+        out_path=os.path.join(umap_dir, f"umap_train_val_test_{ckpt_tag_slug}.png"),
+        csv_path=os.path.join(umap_dir, f"umap_train_val_test_{ckpt_tag_slug}.csv"),
+        title=f"{args.dataset} Train / Val / Test UMAP ({ckpt_tag})",
+        seed=args.seed,
+    )
+    per_class_umap_saved = save_per_class_split_umap_plots(
+        features=merged_features,
+        labels=merged_labels,
+        splits=merged_splits,
+        class_names=class_names,
+        out_dir=per_class_umap_dir,
+        tag_suffix=ckpt_tag_slug,
+        title_prefix=f"{args.dataset} Per-class UMAP ({ckpt_tag})",
         seed=args.seed,
     )
     save_tsne_plot(
@@ -286,8 +314,10 @@ def main():
         print(line)
     if os.path.isfile(inferred_log_path):
         print(f"train_loss_curve: {os.path.join(output_dir, 'train_loss_curve.png')}")
-    print(f"umap_train_val_test: {os.path.join(checkpoint_dir, 'umap_train_val_test.png')}")
-    print(f"umap_train_val_test_csv: {os.path.join(checkpoint_dir, 'umap_train_val_test.csv')}")
+    print(f"umap_train_val_test: {os.path.join(umap_dir, f'umap_train_val_test_{ckpt_tag_slug}.png')}")
+    print(f"umap_train_val_test_csv: {os.path.join(umap_dir, f'umap_train_val_test_{ckpt_tag_slug}.csv')}")
+    print(f"umap_per_class_dir: {per_class_umap_dir}")
+    print(f"umap_per_class_count: {len(per_class_umap_saved)}")
     print(f"val_tsne: {os.path.join(output_dir, 'val_tsne.png')}")
     print(f"test_tsne: {os.path.join(output_dir, 'test_tsne.png')}")
     print(f"saved to: {output_dir}")

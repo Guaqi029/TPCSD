@@ -98,13 +98,37 @@ def compute_macro_metric(per_class_metrics, metric_key):
     return float(np.mean(values))
 
 
+def split_class_order(class_counts, group_sizes=None):
+    class_counts = np.asarray(class_counts, dtype=np.int64)
+    order = np.argsort(-class_counts)
+    num_classes = int(len(order))
+
+    if group_sizes is None:
+        if num_classes == 8:
+            group_sizes = (3, 2, 3)
+        else:
+            return [np.asarray(x, dtype=np.int64) for x in np.array_split(order, 3)]
+
+    group_sizes = tuple(int(x) for x in group_sizes)
+    if sum(group_sizes) != num_classes:
+        raise ValueError(f"group_sizes {group_sizes} do not sum to num_classes={num_classes}")
+
+    groups = []
+    start = 0
+    for size in group_sizes:
+        end = start + size
+        groups.append(np.asarray(order[start:end], dtype=np.int64))
+        start = end
+    return groups
+
+
 def build_group_specs(class_names, class_counts):
     class_names = list(class_names)
     class_counts = np.asarray(class_counts, dtype=np.int64)
-    order = np.argsort(-class_counts)
     group_names = ("head", "medium", "tail")
     groups = []
-    for group_name, idxs in zip(group_names, np.array_split(order, len(group_names))):
+    split_indices = split_class_order(class_counts)
+    for group_name, idxs in zip(group_names, split_indices):
         idxs = np.asarray(idxs, dtype=np.int64)
         groups.append(
             {

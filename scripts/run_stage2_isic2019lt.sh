@@ -27,6 +27,9 @@ HARDEST_K="${HARDEST_K:-3}" # 每轮优先生成虚拟特征的最难类别数
 HARDEST_FRACTION="${HARDEST_FRACTION:-0.5}" # 若 hardest_k=0，则按比例选择最难类别
 VIRTUAL_CONF_THRESH="${VIRTUAL_CONF_THRESH:-0.6}" # 保留虚拟特征所需的分类置信度阈值
 VIRTUAL_CENTER_COS_THRESH="${VIRTUAL_CENTER_COS_THRESH:-0.2}" # 保留虚拟特征所需的类中心余弦阈值
+BOUNDARY_VIRTUAL_RATIO="${BOUNDARY_VIRTUAL_RATIO:-0.4}" # 虚拟样本中偏向边界区域的比例
+BOUNDARY_ALPHA_MIN="${BOUNDARY_ALPHA_MIN:-0.6}" # 边界样本插值时靠近本类中心的最小权重
+BOUNDARY_ALPHA_MAX="${BOUNDARY_ALPHA_MAX:-0.8}" # 边界样本插值时靠近本类中心的最大权重
 STAGE1_RUN_DIR="${STAGE1_RUN_DIR:-}" # 指定 Stage1 run 目录；留空则自动取最新
 # Stage1 checkpoint tag to bootstrap Stage2.
 # Supported tags now include: best(=best_val), best_val, best_test, latest.
@@ -93,6 +96,9 @@ STAGE2_ARGS=(
   --virtual_conf_thresh "${VIRTUAL_CONF_THRESH}" # 虚拟特征筛选的分类置信度阈值
   --virtual_center_cos_thresh "${VIRTUAL_CENTER_COS_THRESH}" # 虚拟特征筛选的类中心相似度阈值
   --virtual_loss_weight "${VIRTUAL_LOSS_WEIGHT}" # 虚拟样本损失权重
+  --boundary_virtual_ratio "${BOUNDARY_VIRTUAL_RATIO}" # 虚拟样本中边界样本所占比例
+  --boundary_alpha_min "${BOUNDARY_ALPHA_MIN}" # 边界样本插值的本类权重下界
+  --boundary_alpha_max "${BOUNDARY_ALPHA_MAX}" # 边界样本插值的本类权重上界
 )
 
 python train_stage2.py "${STAGE2_ARGS[@]}"

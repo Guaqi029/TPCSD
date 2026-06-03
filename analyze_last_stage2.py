@@ -15,9 +15,9 @@ from data.transforms import Transforms
 from models import CosineClassifier, Projector, ResNetBackbone
 from utils.checkpoint_utils import load_state_dict_flexible
 from utils.csv_utils import label_frame_to_int
-from utils.losses import active_prototype_mask, ensure_3d_prototypes, reduce_prototypes_mean
 from utils.metrics import (
     build_group_specs,
+    split_class_order,
     compute_avg_metrics,
     compute_macro_metric,
     compute_group_metric,
@@ -25,7 +25,35 @@ from utils.metrics import (
     format_tail_lines,
     plot_loss_curve_from_log,
 )
-from visualize_embeddings import save_per_class_split_umap_plots, save_real_virtual_tsne, save_split_umap_plot, save_tsne_plot
+from visualize_embeddings import (
+    save_per_class_split_umap_plots,
+    save_real_virtual_tsne,
+    save_split_umap_decision_plot,
+    save_split_umap_plot,
+    save_tsne_plot,
+)
+
+
+def ensure_3d_prototypes(prototypes):
+    if prototypes.dim() == 2:
+        return prototypes.unsqueeze(1)
+    if prototypes.dim() == 3:
+        return prototypes
+    raise ValueError(f"Unsupported prototype shape: {tuple(prototypes.shape)}")
+
+
+def active_prototype_mask(prototypes, eps=1e-12):
+    prototypes_3d = ensure_3d_prototypes(prototypes)
+    return torch.norm(prototypes_3d, p=2, dim=2) > float(eps)
+
+
+def reduce_prototypes_mean(prototypes, active_mask=None, eps=1e-12):
+    prototypes_3d = ensure_3d_prototypes(prototypes)
+    if active_mask is None:
+        active_mask = active_prototype_mask(prototypes_3d, eps=eps)
+    active_mask = active_mask.to(device=prototypes_3d.device, dtype=prototypes_3d.dtype)
+    denom = active_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+    return (prototypes_3d * active_mask.unsqueeze(-1)).sum(dim=1) / denom
 
 
 class SingleTransformDataset(Dataset):
@@ -121,6 +149,35 @@ def compute_per_class_acc(classifier, feats, labels, num_classes, device):
     return acc
 
 
+def compute_prototype_per_class_acc(feats, labels, prototypes, num_classes, device):
+    if prototypes.dim() == 3:
+        proto_norm = torch.norm(prototypes, p=2, dim=2)
+        active = proto_norm > 0
+        counts = active.sum(dim=1, keepdim=True).clamp_min(1)
+        prototypes = (prototypes * active.unsqueeze(-1)).sum(dim=1) / counts
+    with torch.no_grad():
+        x = F.normalize(feats.to(device), p=2, dim=1)
+        proto = F.normalize(prototypes.to(device), p=2, dim=1)
+        scores = x @ proto.t()
+        pred = scores.argmax(dim=1).cpu()
+    acc = torch.zeros(num_classes, dtype=torch.float32)
+    for class_id in range(num_classes):
+        idx = labels == class_id
+        if idx.sum() == 0:
+            acc[class_id] = 0.0
+        else:
+            acc[class_id] = (pred[idx] == class_id).float().mean().item()
+    return acc
+
+
+def predict_from_features(classifier, feats, device):
+    classifier.eval()
+    with torch.no_grad():
+        logits = classifier(feats.to(device))
+        pred = logits.argmax(dim=1).cpu()
+    return pred
+
+
 def softmax_alloc(acc, alpha, total):
     scores = torch.exp(alpha * (1.0 - acc))
     weights = scores / scores.sum()
@@ -145,7 +202,7 @@ def sample_virtual_features_shared_cov(mu_tilde, shared_cov, counts, delta=0.01,
         k = int(counts[class_id].item())
         if k <= 0:
             continue
-        class_active = torch.flatnonzero(active_mask[class_id], as_tuple=False).flatten()
+        class_active = torch.nonzero(active_mask[class_id], as_tuple=False).view(-1)
         if class_active.numel() == 0:
             class_active = torch.arange(centers.shape[1], device=centers.device)
         per_proto = torch.full((class_active.numel(),), k // max(1, class_active.numel()), device=centers.device, dtype=torch.long)
@@ -175,7 +232,7 @@ def sample_virtual_features_diag(mu_tilde, sigma, prototypes, counts, gamma=0.2,
         k = int(counts[class_id].item())
         if k <= 0:
             continue
-        class_active = torch.flatnonzero(active_mask[class_id], as_tuple=False).flatten()
+        class_active = torch.nonzero(active_mask[class_id], as_tuple=False).view(-1)
         if class_active.numel() == 0:
             class_active = torch.arange(centers.shape[1], device=centers.device)
         per_proto = torch.full((class_active.numel(),), k // max(1, class_active.numel()), device=centers.device, dtype=torch.long)
@@ -312,8 +369,7 @@ def main():
 
     class_counts, class_names = build_class_counts(args.csv_file_train)
     groups = build_group_specs(class_names, class_counts)
-    _, _, tail_classes = np.array_split(np.argsort(-class_counts), 3)
-    tail_classes = [int(x) for x in tail_classes.tolist()]
+    tail_classes = [int(x) for x in split_class_order(class_counts)[2].tolist()]
 
     transforms = Transforms(args.image_size)
     train_base = ISICDataset(args.data_path, args.csv_file_train, transform=None)
@@ -400,12 +456,15 @@ def main():
         f"cov_cond={stats['cov_cond']:.6e}"
     )
     prototypes = prototypes.to(device)
-    proto_active_mask = proto_active_mask.to(device)
+    proto_active_mask = active_prototype_mask(prototypes).to(device)
     mu_tilde = args.lambda_mu * mu.unsqueeze(1) + (1.0 - args.lambda_mu) * prototypes
     class_centers = reduce_prototypes_mean(mu_tilde, proto_active_mask)
 
     val_metrics, val_per_class = evaluate_classifier(classifier, val_feats, val_labels, device, len(class_names))
     test_metrics, test_per_class = evaluate_classifier(classifier, test_feats, test_labels, device, len(class_names))
+    train_pred = predict_from_features(classifier, train_feats, device)
+    val_pred = predict_from_features(classifier, val_feats, device)
+    test_pred = predict_from_features(classifier, test_feats, device)
     train_acc = compute_prototype_per_class_acc(train_feats, train_labels, prototypes, len(class_names), device)
     virtual_total = int(len(train_labels) * float(args.virtual_ratio))
     alloc, alloc_weights = softmax_alloc(train_acc, args.aas_alpha, virtual_total)
@@ -510,6 +569,17 @@ def main():
         title=f"{args.dataset} Train / Val / Test UMAP ({ckpt_tag})",
         seed=args.seed,
     )
+    merged_pred = torch.cat([train_pred, val_pred, test_pred], dim=0)
+    save_split_umap_decision_plot(
+        features=merged_features,
+        labels=merged_labels,
+        splits=merged_splits,
+        predictions=merged_pred,
+        class_names=class_names,
+        out_path=os.path.join(umap_dir, f"umap_train_val_test_decision_{ckpt_tag_slug}.png"),
+        title=f"{args.dataset} Train / Val / Test UMAP Decision (approx, {ckpt_tag})",
+        seed=args.seed,
+    )
     per_class_umap_saved = save_per_class_split_umap_plots(
         features=merged_features,
         labels=merged_labels,
@@ -519,6 +589,7 @@ def main():
         tag_suffix=ckpt_tag_slug,
         title_prefix=f"{args.dataset} Per-class UMAP ({ckpt_tag})",
         seed=args.seed,
+        predictions=merged_pred,
     )
 
     save_tsne_plot(
@@ -616,6 +687,7 @@ def main():
         print(f"train_loss_curve: {os.path.join(output_dir, 'train_loss_curve.png')}")
     print(f"umap_train_val_test: {os.path.join(umap_dir, f'umap_train_val_test_{ckpt_tag_slug}.png')}")
     print(f"umap_train_val_test_csv: {os.path.join(umap_dir, f'umap_train_val_test_{ckpt_tag_slug}.csv')}")
+    print(f"umap_train_val_test_decision: {os.path.join(umap_dir, f'umap_train_val_test_decision_{ckpt_tag_slug}.png')}")
     print(f"umap_per_class_dir: {per_class_umap_dir}")
     print(f"umap_per_class_count: {len(per_class_umap_saved)}")
     print(f"val_tsne: {os.path.join(output_dir, 'val_tsne.png')}")

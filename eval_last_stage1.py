@@ -16,6 +16,7 @@ from utils.checkpoint_utils import load_state_dict_flexible
 from utils.metrics import (
     build_group_lookup,
     build_group_specs,
+    split_class_order,
     compute_avg_metrics,
     compute_macro_metric,
     compute_group_metric,
@@ -24,7 +25,12 @@ from utils.metrics import (
     format_tail_lines,
     plot_loss_curve_from_log,
 )
-from visualize_embeddings import save_per_class_split_umap_plots, save_split_umap_plot, save_tsne_plot
+from visualize_embeddings import (
+    save_per_class_split_umap_plots,
+    save_split_umap_decision_plot,
+    save_split_umap_plot,
+    save_tsne_plot,
+)
 
 
 class SingleTransformDataset(Dataset):
@@ -98,6 +104,14 @@ def evaluate(encoder, classifier, loader, device, num_classes):
     return avg_metrics, per_class_metrics, features, ground_truth.cpu()
 
 
+def predict_from_features(classifier, features, device):
+    classifier.eval()
+    with torch.no_grad():
+        logits = classifier(features.to(device))
+        pred = logits.argmax(dim=1).cpu()
+    return pred
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
@@ -122,8 +136,7 @@ def main():
     class_counts, class_names = build_class_counts(args.csv_file_train)
     groups = build_group_specs(class_names, class_counts)
     group_lookup = build_group_lookup(groups)
-    _, _, tail_classes = np.array_split(np.argsort(-class_counts), 3)
-    tail_classes = [int(x) for x in tail_classes.tolist()]
+    tail_classes = [int(x) for x in split_class_order(class_counts)[2].tolist()]
 
     transforms = Transforms(args.image_size)
     train_base = ISICDataset(args.data_path, args.csv_file_train, transform=None)
@@ -164,6 +177,9 @@ def main():
     test_metrics, test_per_class, test_features, test_labels = evaluate(
         encoder, classifier, test_loader, device, len(class_names)
     )
+    train_pred = predict_from_features(classifier, train_features, device)
+    val_pred = predict_from_features(classifier, val_features, device)
+    test_pred = predict_from_features(classifier, test_features, device)
 
     val_group_acc = compute_group_metric(val_per_class, groups, metric_key="acc")
     val_group_bac = compute_group_metric(val_per_class, groups, metric_key="bac")
@@ -249,6 +265,16 @@ def main():
         title=f"{args.dataset} Train / Val / Test UMAP ({ckpt_tag})",
         seed=args.seed,
     )
+    save_split_umap_decision_plot(
+        features=merged_features,
+        labels=merged_labels,
+        splits=merged_splits,
+        predictions=torch.cat([train_pred, val_pred, test_pred], dim=0),
+        class_names=class_names,
+        out_path=os.path.join(umap_dir, f"umap_train_val_test_decision_{ckpt_tag_slug}.png"),
+        title=f"{args.dataset} Train / Val / Test UMAP Decision (approx, {ckpt_tag})",
+        seed=args.seed,
+    )
     per_class_umap_saved = save_per_class_split_umap_plots(
         features=merged_features,
         labels=merged_labels,
@@ -258,6 +284,7 @@ def main():
         tag_suffix=ckpt_tag_slug,
         title_prefix=f"{args.dataset} Per-class UMAP ({ckpt_tag})",
         seed=args.seed,
+        predictions=torch.cat([train_pred, val_pred, test_pred], dim=0),
     )
     save_tsne_plot(
         features=val_features,
@@ -316,6 +343,7 @@ def main():
         print(f"train_loss_curve: {os.path.join(output_dir, 'train_loss_curve.png')}")
     print(f"umap_train_val_test: {os.path.join(umap_dir, f'umap_train_val_test_{ckpt_tag_slug}.png')}")
     print(f"umap_train_val_test_csv: {os.path.join(umap_dir, f'umap_train_val_test_{ckpt_tag_slug}.csv')}")
+    print(f"umap_train_val_test_decision: {os.path.join(umap_dir, f'umap_train_val_test_decision_{ckpt_tag_slug}.png')}")
     print(f"umap_per_class_dir: {per_class_umap_dir}")
     print(f"umap_per_class_count: {len(per_class_umap_saved)}")
     print(f"val_tsne: {os.path.join(output_dir, 'val_tsne.png')}")

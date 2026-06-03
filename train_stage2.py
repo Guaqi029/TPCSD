@@ -19,6 +19,7 @@ from utils.csv_utils import label_frame_to_int
 from utils.metrics import (
     append_per_class_records,
     build_group_specs,
+    split_class_order,
     compute_avg_metrics,
     compute_macro_metric,
     compute_per_class_metrics,
@@ -228,6 +229,80 @@ def sample_virtual_features(mu, shared_cov, counts, delta=0.01, cov_scale_factor
     return feats, labels
 
 
+def compute_boundary_partners(class_centers):
+    norm_centers = F.normalize(class_centers, p=2, dim=1)
+    sim = norm_centers @ norm_centers.t()
+    sim.fill_diagonal_(-float("inf"))
+    return sim.argmax(dim=1)
+
+
+def sample_mixed_virtual_features(
+    class_centers,
+    shared_cov,
+    counts,
+    boundary_ratio=0.0,
+    boundary_partners=None,
+    boundary_alpha_min=0.6,
+    boundary_alpha_max=0.8,
+    delta=0.01,
+    cov_scale_factor=1.0,
+):
+    device = class_centers.device
+    feat_dim = class_centers.shape[1]
+    feats = []
+    labels = []
+    num_classes = class_centers.shape[0]
+    base_cov = shared_cov * float(cov_scale_factor)
+    base_cov = base_cov + torch.eye(shared_cov.shape[0], device=device, dtype=shared_cov.dtype) * (float(delta) ** 2)
+    zero_mean = torch.zeros(feat_dim, device=device, dtype=class_centers.dtype)
+    noise_dist = torch.distributions.MultivariateNormal(loc=zero_mean, covariance_matrix=base_cov)
+    boundary_ratio = float(boundary_ratio)
+
+    if boundary_partners is None:
+        boundary_partners = compute_boundary_partners(class_centers)
+
+    for c in range(num_classes):
+        total_k = int(counts[c].item())
+        if total_k <= 0:
+            continue
+
+        boundary_k = int(round(total_k * boundary_ratio))
+        boundary_k = max(0, min(total_k, boundary_k))
+        if boundary_ratio > 0.0 and total_k > 1 and boundary_k == 0:
+            boundary_k = 1
+        center_k = total_k - boundary_k
+
+        if center_k > 0:
+            mvn = torch.distributions.MultivariateNormal(loc=class_centers[c], covariance_matrix=base_cov)
+            z_center = mvn.sample((center_k,))
+            feats.append(z_center)
+            labels.append(torch.full((center_k,), c, device=device, dtype=torch.long))
+
+        if boundary_k > 0:
+            partner_idx = int(boundary_partners[c].item())
+            alpha = torch.empty(boundary_k, device=device, dtype=class_centers.dtype).uniform_(
+                float(boundary_alpha_min),
+                float(boundary_alpha_max),
+            )
+            means = (
+                alpha.unsqueeze(1) * class_centers[c].unsqueeze(0)
+                + (1.0 - alpha).unsqueeze(1) * class_centers[partner_idx].unsqueeze(0)
+            )
+            z_boundary = means + noise_dist.sample((boundary_k,))
+            feats.append(z_boundary)
+            labels.append(torch.full((boundary_k,), c, device=device, dtype=torch.long))
+
+    if not feats:
+        return (
+            torch.empty(0, feat_dim, device=device),
+            torch.empty(0, dtype=torch.long, device=device),
+        )
+
+    feats = torch.cat(feats, dim=0)
+    labels = torch.cat(labels, dim=0)
+    return feats, labels
+
+
 def filter_virtual_features(
     virtual_feats,
     virtual_labels,
@@ -382,6 +457,9 @@ def main():
     parser.add_argument("--virtual_conf_thresh", type=float, default=0.6)
     parser.add_argument("--virtual_center_cos_thresh", type=float, default=0.2)
     parser.add_argument("--virtual_loss_weight", type=float, default=1.0)
+    parser.add_argument("--boundary_virtual_ratio", type=float, default=0.4)
+    parser.add_argument("--boundary_alpha_min", type=float, default=0.6)
+    parser.add_argument("--boundary_alpha_max", type=float, default=0.8)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -391,6 +469,12 @@ def main():
         raise ValueError("hardest_k must be >= 0")
     if args.hardest_k == 0 and not (0.0 < float(args.hardest_fraction) <= 1.0):
         raise ValueError("hardest_fraction must be in (0, 1] when hardest_k is 0")
+    if not (0.0 <= float(args.boundary_virtual_ratio) <= 1.0):
+        raise ValueError("boundary_virtual_ratio must be in [0, 1]")
+    if not (0.0 <= float(args.boundary_alpha_min) <= 1.0 and 0.0 <= float(args.boundary_alpha_max) <= 1.0):
+        raise ValueError("boundary_alpha_min/max must be in [0, 1]")
+    if float(args.boundary_alpha_min) > float(args.boundary_alpha_max):
+        raise ValueError("boundary_alpha_min must be <= boundary_alpha_max")
 
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -413,8 +497,7 @@ def main():
     if not args.use_class_weight:
         class_weights = None
     group_specs = build_group_specs(train_base.class_names, counts)
-    _, _, tail_classes = np.array_split(np.argsort(-counts), 3)
-    tail_classes = [int(x) for x in tail_classes.tolist()]
+    tail_classes = [int(x) for x in split_class_order(counts)[2].tolist()]
 
     if not args.use_projector:
         raise ValueError("Stage2 requires --use_projector because prototypes live in the projected feature space.")
@@ -545,10 +628,15 @@ def main():
 
         mu_tilde_real = args.lambda_mu * mu + (1.0 - args.lambda_mu) * proto
         class_centers_real = mu_tilde_real
-        seed_virtual_feats, seed_virtual_labels = sample_virtual_features(
-            mu_tilde_real,
+        boundary_partners_real = compute_boundary_partners(class_centers_real)
+        seed_virtual_feats, seed_virtual_labels = sample_mixed_virtual_features(
+            class_centers_real,
             shared_cov,
             alloc,
+            boundary_ratio=args.boundary_virtual_ratio,
+            boundary_partners=boundary_partners_real,
+            boundary_alpha_min=args.boundary_alpha_min,
+            boundary_alpha_max=args.boundary_alpha_max,
             delta=args.delta_noise,
             cov_scale_factor=args.cov_scale_factor,
         )
@@ -578,10 +666,15 @@ def main():
 
         mu_tilde = args.lambda_mu * mu + (1.0 - args.lambda_mu) * proto
         class_centers = mu_tilde
-        final_virtual_feats, final_virtual_labels = sample_virtual_features(
-            mu_tilde,
+        boundary_partners = compute_boundary_partners(class_centers)
+        final_virtual_feats, final_virtual_labels = sample_mixed_virtual_features(
+            class_centers,
             shared_cov,
             alloc,
+            boundary_ratio=args.boundary_virtual_ratio,
+            boundary_partners=boundary_partners,
+            boundary_alpha_min=args.boundary_alpha_min,
+            boundary_alpha_max=args.boundary_alpha_max,
             delta=args.delta_noise,
             cov_scale_factor=args.cov_scale_factor,
         )
@@ -671,6 +764,10 @@ def main():
         train_virtual_loss = virtual_cls_sum / max(1, step_count)
         train_anchor_loss = 0.0
         hardest_names = [train_base.class_names[int(idx)] for idx in hardest_indices.tolist()]
+        hardest_partner_names = [
+            f"{train_base.class_names[int(idx)]}->{train_base.class_names[int(boundary_partners[int(idx)].item())]}"
+            for idx in hardest_indices.tolist()
+        ]
         train_acc, train_f1, train_auc, train_bac, train_bacc, train_sens, train_spec = train_metrics
 
         append_per_class_records(per_class_csv, epoch, "val", val_per_class, train_base.class_names)
@@ -693,6 +790,7 @@ def main():
             f"hardest_k={len(hardest_names)} "
             f"seed_virtual={seed_kept}/{seed_total} "
             f"final_virtual={final_kept}/{final_total} "
+            f"boundary_ratio={args.boundary_virtual_ratio:.2f} "
             f"cov_scale={args.cov_scale_factor:.4f} "
             f"cos_scale={args.cosine_scale:.4f} "
             f"train_acc={train_acc:.6f} train_bac={train_bac:.6f} train_bacc={train_bacc:.6f} "
@@ -700,6 +798,7 @@ def main():
             f"test_acc={test_metrics[0]:.6f} test_bac={test_metrics[3]:.6f} test_bacc={test_metrics[4]:.6f}"
         )
         hardest_line = "Hardest classes: " + ", ".join(hardest_names)
+        boundary_line = "Boundary partners: " + ", ".join(hardest_partner_names)
 
         gaussian_line = (
             "Gaussian stats: "
@@ -733,6 +832,8 @@ def main():
             f.write(log_line + "\n")
             print(hardest_line)
             f.write(hardest_line + "\n")
+            print(boundary_line)
+            f.write(boundary_line + "\n")
             for line in format_tail_lines(val_per_class, train_base.class_names, tail_classes, "val"):
                 print(line)
                 f.write(line + "\n")

@@ -28,6 +28,7 @@ from utils.csv_utils import label_frame_to_int
 from utils.metrics import (
     append_per_class_records,
     build_group_specs,
+    split_class_order,
     compute_avg_metrics,
     compute_macro_metric,
     compute_per_class_metrics,
@@ -103,8 +104,7 @@ def build_class_weights(train_csv, device):
 
 
 def split_groups(counts):
-    order = np.argsort(-counts)
-    groups = np.array_split(order, 3)
+    groups = split_class_order(counts)
     head = [int(i) for i in groups[0]]
     medium = [int(i) for i in groups[1]]
     tail = [int(i) for i in groups[2]]

@@ -424,6 +424,100 @@ def save_split_umap_plot(
     return True
 
 
+def save_split_umap_decision_plot(
+    features,
+    labels,
+    splits,
+    predictions,
+    class_names,
+    out_path,
+    title="Train / Val / Test UMAP (approx decision regions)",
+    seed=42,
+):
+    try:
+        import matplotlib.pyplot as plt
+        from sklearn.neighbors import KNeighborsClassifier
+    except ImportError:
+        return False
+
+    features = _to_numpy(features)
+    labels = _to_numpy(labels).astype(np.int64)
+    predictions = _to_numpy(predictions).astype(np.int64)
+    splits = np.asarray(splits)
+
+    if features.shape[0] < 2:
+        return False
+
+    embedding = _compute_umap_embedding(features, seed=seed)
+
+    k = min(15, max(1, embedding.shape[0] - 1))
+    surrogate = KNeighborsClassifier(n_neighbors=k, weights="distance")
+    surrogate.fit(embedding, predictions)
+
+    x_min, x_max = embedding[:, 0].min() - 0.5, embedding[:, 0].max() + 0.5
+    y_min, y_max = embedding[:, 1].min() - 0.5, embedding[:, 1].max() + 0.5
+    xx, yy = np.meshgrid(
+        np.linspace(x_min, x_max, 260),
+        np.linspace(y_min, y_max, 260),
+    )
+    zz = surrogate.predict(np.c_[xx.ravel(), yy.ravel()]).reshape(xx.shape)
+
+    marker_map = {"train": "o", "val": "^", "test": "s"}
+    split_order = ["train", "val", "test"]
+    unique_labels = np.unique(labels)
+    cmap = plt.cm.get_cmap("tab20", max(20, len(class_names), len(unique_labels)))
+
+    fig, ax = plt.subplots(figsize=(10, 8), dpi=150)
+    ax.contourf(xx, yy, zz, levels=np.arange(zz.max() + 2) - 0.5, cmap=cmap, alpha=0.12)
+
+    for color_idx, class_id in enumerate(unique_labels):
+        class_mask = labels == class_id
+        color = cmap(color_idx)
+        for split_name in split_order:
+            split_mask = splits == split_name
+            mask = class_mask & split_mask
+            if not np.any(mask):
+                continue
+            ax.scatter(
+                embedding[mask, 0],
+                embedding[mask, 1],
+                s=10,
+                alpha=0.72,
+                color=color,
+                marker=marker_map[split_name],
+                linewidths=0,
+            )
+
+    wrong_mask = predictions != labels
+    if np.any(wrong_mask):
+        ax.scatter(
+            embedding[wrong_mask, 0],
+            embedding[wrong_mask, 1],
+            s=38,
+            facecolors="none",
+            edgecolors="red",
+            linewidths=0.9,
+            marker="o",
+            label="wrong",
+        )
+
+    marker_handles = [
+        ax.scatter([], [], color="black", marker=marker_map[split_name], s=42, label=split_name)
+        for split_name in split_order
+    ]
+    if np.any(wrong_mask):
+        marker_handles.append(ax.scatter([], [], facecolors="none", edgecolors="red", s=42, linewidths=0.9, marker="o", label="wrong"))
+    ax.legend(handles=marker_handles, title="split", loc="best", frameon=False)
+    ax.set_title(title)
+    ax.set_xlabel("UMAP-1")
+    ax.set_ylabel("UMAP-2")
+    ax.grid(True, alpha=0.15)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
 def save_per_class_split_umap_plots(
     features,
     labels,
@@ -433,6 +527,7 @@ def save_per_class_split_umap_plots(
     tag_suffix="",
     title_prefix="Per-class UMAP",
     seed=42,
+    predictions=None,
 ):
     try:
         import matplotlib.pyplot as plt
@@ -443,6 +538,7 @@ def save_per_class_split_umap_plots(
     features = _to_numpy(features)
     labels = _to_numpy(labels).astype(np.int64)
     splits = np.asarray(splits)
+    predictions = None if predictions is None else _to_numpy(predictions).astype(np.int64)
     class_names = list(class_names)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -455,6 +551,7 @@ def save_per_class_split_umap_plots(
         class_mask = labels == int(class_id)
         class_features = features[class_mask]
         class_splits = splits[class_mask]
+        class_predictions = None if predictions is None else predictions[class_mask]
         if class_features.shape[0] < 2:
             continue
 
@@ -490,6 +587,22 @@ def save_per_class_split_umap_plots(
                 ax.scatter([], [], color=color_map[split_name], marker=marker_map[split_name], s=42, label=split_name)
             )
 
+        if class_predictions is not None:
+            wrong_mask = class_predictions != int(class_id)
+            if np.any(wrong_mask):
+                ax.scatter(
+                    embedding[wrong_mask, 0],
+                    embedding[wrong_mask, 1],
+                    s=42,
+                    facecolors="none",
+                    edgecolors="red",
+                    linewidths=0.95,
+                    marker="o",
+                )
+                marker_handles.append(
+                    ax.scatter([], [], facecolors="none", edgecolors="red", s=42, linewidths=0.95, marker="o", label="wrong")
+                )
+
         if marker_handles:
             ax.legend(handles=marker_handles, title="split", loc="best", frameon=False)
         ax.set_title(f"{title_prefix}: {class_name}")
@@ -506,6 +619,8 @@ def save_per_class_split_umap_plots(
                 "y": embedding[:, 1],
                 "label": np.full(class_features.shape[0], int(class_id), dtype=np.int64),
                 "split": class_splits,
+                "pred": np.full(class_features.shape[0], -1, dtype=np.int64) if class_predictions is None else class_predictions,
+                "correct": np.full(class_features.shape[0], True, dtype=bool) if class_predictions is None else (class_predictions == int(class_id)),
             }
         ).to_csv(csv_path, index=False)
         saved.append((class_name, out_path, csv_path))
